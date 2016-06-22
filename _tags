@@ -1,0 +1,9 @@
+true : bin_annot, safe_string, package(bytes), warn(-40)
+
+<src> : include
+<test> : include
+
+<*/*>: package(bs_devkit), \
+       package(bs_api), \
+       package(ppx_jane), \
+       thread

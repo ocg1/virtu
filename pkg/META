@@ -1,0 +1,7 @@
+description = "Market-maker bot for BitMEX"
+version = "%%VERSION%%"
+requires = ""
+archive(byte) = "virtu.cma"
+archive(native) = "virtu.cmxa"
+plugin(byte) = "virtu.cma"
+plugin(native) = "virtu.cmxs"
