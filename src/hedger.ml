@@ -231,6 +231,7 @@ let rpc_server port =
         | None -> subscribe sym max_pos
       in
       List.iter symbols ~f:handle_sub;
+      Option.iter !tickups_w ~f:Pipe.close;
       let r, w = Pipe.create () in
       tickups_w := Some w;
       Deferred.Or_error.return r
@@ -238,7 +239,7 @@ let rpc_server port =
       (* TODO: Unsubscribe *)
       debug "RPC <- Unsubscribe";
       List.iter symbols ~f:(String.Table.remove subscriptions);
-      Option.iter !tickups_w ~f:(fun p -> Pipe.close p; tickups_w := None);
+      Option.iter !tickups_w ~f:Pipe.close;
       Deferred.Or_error.return @@ Pipe.of_list []
   in
   (* let position_f state query = *)
