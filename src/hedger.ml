@@ -237,7 +237,7 @@ let rpc_server port =
           ) >>= function
         | Ok () -> Deferred.Or_error.return ()
         | Error exn ->
-          error "rpc_server %s" Exn.(backtrace ());
+          error "rpc_server %s" Exn.(to_string exn);
           Deferred.Or_error.of_exn exn
       end
     | Unsubscribe symbols ->

@@ -10,6 +10,7 @@ open Bs_api.BMEX
 let api_key = ref ""
 let api_secret = ref @@ Cstruct.of_string ""
 let testnet = ref true
+let dry_run = ref false
 let hedger_port = ref 0
 let quoted_instruments : int String.Table.t = String.Table.create ()
 
@@ -77,8 +78,22 @@ module OB = struct
 end
 
 module Order = struct
-  let submit orders = Rest.Order.submit ~testnet:!testnet ~log:Lazy.(force log) ~key:!api_key ~secret:!api_secret orders
-  let update orders = Rest.Order.update ~testnet:!testnet ~log:Lazy.(force log) ~key:!api_key ~secret:!api_secret orders
+  let submit orders =
+    if !dry_run then begin
+      info "[Sim] submit %s" Yojson.Safe.(to_string @@ `List orders);
+      Deferred.Or_error.return ""
+    end
+    else
+    Rest.Order.submit ~testnet:!testnet ~log:Lazy.(force log) ~key:!api_key ~secret:!api_secret orders
+
+  let update orders =
+    if !dry_run then begin
+      info "[Sim] update %s" Yojson.Safe.(to_string @@ `List orders);
+      Deferred.Or_error.return ""
+    end
+    else
+    Rest.Order.update ~testnet:!testnet ~log:Lazy.(force log) ~key:!api_key ~secret:!api_secret orders
+
   let cancel orderID = Rest.Order.cancel ~testnet:!testnet ~log:Lazy.(force log) ~key:!api_key ~secret:!api_secret orderID
   let cancel_all ?symbol ?filter = Rest.Order.cancel_all ~testnet:!testnet ~log:Lazy.(force log) ~key:!api_key ~secret:!api_secret ?symbol ?filter
   let cancel_all_after timeout = Rest.Order.cancel_all_after ~testnet:!testnet ~log:Lazy.(force log) ~key:!api_key ~secret:!api_secret timeout
@@ -479,11 +494,12 @@ let rpc_client port =
       error "rpc terminated";
       loop ()
     | Error exn ->
-      error "rpc_client crashed: %s" Exn.(backtrace ());
+      error "rpc_client crashed: %s" @@ Exn.(to_string exn);
       after @@ Time.Span.of_int_sec 5 >>= loop
   in loop ()
 
-let main cfg port daemon pidfile logfile loglevel mainnet instruments () =
+let main cfg port daemon pidfile logfile loglevel mainnet dry_run' instruments () =
+  dry_run := dry_run';
   testnet := not mainnet;
   let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> presult_exn in
   let { Cfg.key; secret; quote } = List.Assoc.find_exn cfg (if mainnet then "BMEX" else "BMEXT") in
@@ -514,6 +530,7 @@ let command =
     +> flag "-logfile" (optional_with_default "log/virtu.log" string) ~doc:"filename Path of the log file (log/virtu.log)"
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
     +> flag "-mainnet" no_arg ~doc:" Use mainnet"
+    +> flag "-dry" no_arg ~doc:" Simulation mode"
     +> anon (sequence (t2 ("instrument" %: string) ("quote" %: int)))
   in
   Command.basic ~summary:"Market maker bot" spec main
