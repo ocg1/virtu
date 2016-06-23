@@ -182,7 +182,7 @@ let on_position_update (symbol: string) p =
     end
 
 let on_ticker_update { Protocols.OrderBook.symbol; side; best; vwap } =
-  debug "on_ticker_update";
+  debug "<- tickup";
   let rtickers = RemoteOB.tickers side in
   match String.Table.find_or_add ~default:(fun () -> { best; vwap }) rtickers symbol with
   | { vwap=old_vwap } when old_vwap <> vwap -> begin
@@ -464,38 +464,38 @@ let market_make buf =
 let rpc_client port =
   let open Rpc in
   let open Protocols in
-  let on_response msg =
-    debug "rpc_client: on_response";
-    let open Pipe_rpc in match msg with
-    | Pipe_message.Closed (`Error err) ->
-      error "rpc_client: closed with error %s" @@ Error.to_string_hum err;
-      Pipe_response.Continue
-    | Closed `By_remote_side ->
-      error "rpc_client: closed by remote side";
-      Continue
-    | Update (OrderBook.Subscribed (sym, max_pos)) ->
-      info "hedger subscribed to %s %d" sym max_pos;
-      Continue
-    | Update (Ticker t) -> Wait (on_ticker_update t);
+  let on_msg = function
+  | OrderBook.Subscribed (sym, max_pos) ->
+    info "hedger subscribed to %s %d" sym max_pos;
+    Deferred.unit
+  | Ticker t -> on_ticker_update t
   in
   let client_f c =
     let quoted_instrs = String.Table.to_alist quoted_instruments in
-    don't_wait_for @@
-    Pipe.iter position_r ~f:(fun position_update ->
-        Deferred.ignore @@ Rpc.dispatch Position.t c position_update
-      );
-    Pipe_rpc.dispatch_iter OrderBook.t c
-      (OrderBook.Subscribe quoted_instrs) ~f:on_response
+    (* don't_wait_for @@ *)
+    (* Pipe.iter position_r ~f:(fun position_update -> *)
+    (*     Deferred.ignore @@ Rpc.dispatch Position.t c position_update *)
+    (*   ); *)
+    Pipe_rpc.dispatch OrderBook.t c
+      (OrderBook.Subscribe quoted_instrs) >>= function
+    | Ok (Ok (feed, meta)) ->
+      Pipe.iter feed ~f:on_msg
+    | Ok (Error err) ->
+      error "dispatch returned error: %s" (Error.to_string_hum err);
+      Deferred.unit
+    | Error err ->
+      error "dispatch raised: %s" Error.(to_string_hum err);
+      Deferred.unit
   in
   let rec loop () =
     debug "rpc starting";
     Connection.with_client ~host:"localhost" ~port client_f >>= function
-    | Ok _ ->
-      error "rpc terminated";
-      loop ()
+    | Ok () ->
+        error "rpc returned, restarting";
+        after @@ Time.Span.of_int_sec 5 >>= loop
     | Error exn ->
-      error "rpc_client crashed: %s" @@ Exn.(to_string exn);
-      after @@ Time.Span.of_int_sec 5 >>= loop
+        error "rpc_client crashed: %s" @@ Exn.(to_string exn);
+        after @@ Time.Span.of_int_sec 5 >>= loop
   in loop ()
 
 let main cfg port daemon pidfile logfile loglevel mainnet dry_run' instruments () =

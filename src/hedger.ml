@@ -29,7 +29,7 @@ let bfx_asks : (Int.t Int.Map.t) String.Table.t = String.Table.create ()
 let bfx_bid_vwaps : (int * int) String.Table.t = String.Table.create ()
 let bfx_ask_vwaps : (int * int) String.Table.t = String.Table.create ()
 
-let tickups_r, tickups_w = Pipe.create ()
+let tickups_w = ref None
 
 let to_remote_sym = function
   | "XBTUSD" -> "BTCUSD"
@@ -54,6 +54,7 @@ let on_bfx_book_partial sym os =
   let fold_f (bids, asks) { BFX.Ws.Book.Raw.id; price; amount } =
     let price = satoshis_int_of_float_exn price in
     let qty = bps_int_of_float_exn amount in
+    (* Log.debug log_bfx "%d %d %d" id price qty; *)
     Int.Table.set orders id { price; qty };
     match Int.sign qty with
     | Zero -> invalid_arg "on_bfx_book_partial"
@@ -79,7 +80,7 @@ let on_bfx_book_update sym { BFX.Ws.Book.Raw.id; price = new_price; amount = new
   in
   let book_modify_qty book price qty =
     try book_modify_qty_exn book price qty with _ ->
-      Log.error log_bfx "update_depth: inconsistent orderbooks!";
+      Log.error log_bfx "book_modify_qty: inconsistent %s %d %d" sym price qty;
       book
   in
   let orders = String.Table.find_exn bfx_orders sym in
@@ -92,6 +93,7 @@ let on_bfx_book_update sym { BFX.Ws.Book.Raw.id; price = new_price; amount = new
       Some (satoshis_int_of_float_exn new_price),
       Some (bps_int_of_float_exn new_qty)
   in
+  (* Log.debug log_bfx "<- %d %d %d" id (Option.value ~default:0 new_price) (Option.value ~default:0 new_qty); *)
   let abs_new_qty = Option.map new_qty Int.abs in
   let action = if Option.is_none new_price then BMEX.Delete else Insert in
   let old_book = String.Table.find_exn books sym in
@@ -104,8 +106,8 @@ let on_bfx_book_update sym { BFX.Ws.Book.Raw.id; price = new_price; amount = new
       book_add_qty old_book newp newq
     | Insert, Some newp, Some newq, Some { price = old_price; qty = old_qty } ->
       Int.Table.set orders id { price = newp; qty = Option.value_exn new_qty };
-      let new_book = book_modify_qty old_book old_price (Int.neg newq) in
-      book_modify_qty new_book newp newq
+      let intermediate_book = book_modify_qty old_book old_price (Int.neg newq) in
+      book_modify_qty intermediate_book newp newq
     | _ ->
       Log.error log_bfx "Our internal orderbook is inconsistent with a BFX update!";
       old_book
@@ -121,11 +123,16 @@ let on_bfx_book_update sym { BFX.Ws.Book.Raw.id; price = new_price; amount = new
   let old_best_elt = Option.map ~f:fst @@ best_elt_f old_book in
   let new_best_elt = Option.map ~f:fst @@ best_elt_f new_book in
   begin match old_best_elt, new_best_elt, old_vwap with
-    | Some old_best, Some new_best, Some (old_vwap, _) when old_best <> new_best || old_vwap <> new_vwap ->
-      Pipe.write_without_pushback tickups_w @@ Protocols.OrderBook.create_ticker ~symbol:sym ~side ~best:new_best ~vwap:new_vwap ();
+  | Some old_best, Some new_best, Some (old_vwap, _) when old_best <> new_best || old_vwap <> new_vwap ->
+    Option.iter !tickups_w ~f:(fun p ->
+        (try
+          Pipe.write_without_pushback p @@
+          Protocols.OrderBook.(Ticker (create_ticker ~symbol:sym ~side ~best:new_best ~vwap:new_vwap ()));
+        with _ -> tickups_w := None);
+        debug "-> tickup"
+      );
     | _ -> ()
-  end;
-  Log.debug log_bfx "BFX %s %s vwap=%.2f totalv=%.3f" sym (Side.show side) Int.(to_float new_vwap /. to_float total_v *. 1e-8) (Int.to_float total_v /. 1e4)
+  end
 
 let subscribe_r, subscribe_w = Pipe.create ()
 
@@ -165,9 +172,7 @@ let bfx_ws buf =
             | #Yojson.Safe.json :: _ ->
               invalid_arg "client_ws: on_ws_msg: got unexpected msg payload"
           in
-          Log.debug log_bfx "-> %s %s"
-            (Ws.Priv.show_msg_type msg_type)
-            (Ws.Priv.show_update_type update_type);
+          Ws.Priv.(Log.debug log_bfx "<- %s %s" (show_msg_type msg_type) (show_update_type update_type));
           match msg_type, update_type with
           | Position, _ ->
             List.iter tl ~f:(fun json ->
@@ -193,17 +198,29 @@ let bfx_ws buf =
           begin match updates with
             | [] -> ()
             | [u] ->
-              (* debug "<- %s" @@ Ws.Book.Raw.show u; *)
-              on_bfx_book_update sym u
+                (* debug "<- %s" @@ Ws.Book.Raw.show u; *)
+                on_bfx_book_update sym u
             | partial -> on_bfx_book_partial sym partial
           end
         | _ -> ()
   in
   Ws.with_connection ~log:(Lazy.force log) ~auth:(!bfx_key, !bfx_secret) ~to_ws:subscribe_r ~on_ws_msg ()
 
+let subscribe sym max_pos =
+  String.Table.set subscriptions sym max_pos;
+  String.Table.set bfx_orders sym (Int.Table.create ());
+  String.Table.set bfx_bids sym (Int.Map.empty);
+  String.Table.set bfx_asks sym (Int.Map.empty);
+  Pipe.write_without_pushback subscribe_w @@
+  BFX.Ws.Ev.create "subscribe"
+    ["channel", `String "book";
+     "pair", `String (to_remote_sym sym);
+     "prec", `String "R0"
+    ] ()
+
 let rpc_server port =
   let module P = Protocols in
-  let orderbook_f state query writer =
+  let orderbook_f state query =
     match query with
     | P.OrderBook.Subscribe symbols ->
       debug "RPC <- Subscribe";
@@ -211,52 +228,33 @@ let rpc_server port =
         let open Rpc.Pipe_rpc in
         match String.Table.find subscriptions sym with
         | Some _ -> String.Table.set subscriptions sym max_pos
-        | None ->
-          String.Table.set subscriptions sym max_pos;
-          String.Table.set bfx_orders sym (Int.Table.create ());
-          String.Table.set bfx_bids sym (Int.Map.empty);
-          String.Table.set bfx_asks sym (Int.Map.empty);
-          Pipe.write_without_pushback subscribe_w @@
-          BFX.Ws.Ev.create "subscribe" ["channel", `String "book";
-                                        "pair", `String (to_remote_sym sym);
-                                        "prec", `String "R0"] ();
+        | None -> subscribe sym max_pos
       in
       List.iter symbols ~f:handle_sub;
-      begin try_with ~here:[%here]
-          (fun () ->
-             Pipe.iter tickups_r ~f:(fun t ->
-                 if String.Table.mem subscriptions t.symbol then begin
-                   match Rpc.Pipe_rpc.Direct_stream_writer.write writer (P.OrderBook.Ticker t) with
-                   | `Closed -> Deferred.unit (* TODO: Unsubscribe *)
-                   | `Flushed v ->
-                     debug "tickup sent";
-                     v
-                 end
-                 else Deferred.unit
-               )
-          ) >>= function
-        | Ok () -> Deferred.Or_error.return ()
-        | Error exn ->
-          error "rpc_server %s" Exn.(to_string exn);
-          Deferred.Or_error.of_exn exn
-      end
+      let r, w = Pipe.create () in
+      tickups_w := Some w;
+      Deferred.Or_error.return r
     | Unsubscribe symbols ->
       (* TODO: Unsubscribe *)
       debug "RPC <- Unsubscribe";
       List.iter symbols ~f:(String.Table.remove subscriptions);
-      Deferred.Or_error.return ()
+      Option.iter !tickups_w ~f:(fun p -> Pipe.close p; tickups_w := None);
+      Deferred.Or_error.return @@ Pipe.of_list []
   in
-  let position_f state query =
-    debug "RPC <- position";
-    ()
-  in
-  let orderbook_impl = Rpc.Pipe_rpc.implement_direct P.OrderBook.t orderbook_f in
-  let position_impl = Rpc.Rpc.implement' P.Position.t position_f in
-  let implementations = Rpc.Implementations.create_exn [orderbook_impl; position_impl] `Raise in
+  (* let position_f state query = *)
+  (*   debug "RPC <- position"; *)
+  (*   () *)
+  (* in *)
+  let orderbook_impl = Rpc.Pipe_rpc.implement P.OrderBook.t orderbook_f in
+  (* let position_impl = Rpc.Rpc.implement' P.Position.t position_f in *)
+  let implementations = Rpc.Implementations.create_exn
+      [orderbook_impl;
+       (* position_impl *)
+      ] `Raise in
   let state_of_addr_conn addr conn = () in
   Rpc.Connection.serve implementations state_of_addr_conn (Tcp.on_port port) ()
 
-let main cfg port daemon pidfile logfile loglevel () =
+let main cfg port daemon pidfile logfile loglevel instruments () =
   let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> presult_exn in
   let { Cfg.key; secret } = List.Assoc.find_exn cfg "BFX" in
   bfx_key := key;
@@ -268,6 +266,7 @@ let main cfg port daemon pidfile logfile loglevel () =
   set_level (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
   Log.set_level log_bfx (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
   Out_channel.write_all pidfile ~data:(Unix.getpid () |> Pid.to_string);
+  List.iter instruments ~f:(fun (i, q) -> subscribe i q);
   don't_wait_for @@ bfx_ws buf;
   don't_wait_for @@ Deferred.ignore @@ rpc_server port;
   never_returns @@ Scheduler.go ()
@@ -283,6 +282,7 @@ let command =
     +> flag "-pidfile" (optional_with_default "run/hedger.pid" string) ~doc:"filename Path of the pid file (run/hedger.pid)"
     +> flag "-logfile" (optional_with_default "log/hedger.log" string) ~doc:"filename Path of the log file (log/hedger.log)"
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
+    +> anon (sequence (t2 ("instrument" %: string) ("quote" %: int)))
   in
   Command.basic ~summary:"Hedger bot" spec main
 
