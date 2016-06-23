@@ -1,4 +1,8 @@
 PKG bytes
+PKG core
+PKG async
+PKG bs_devkit
+PKG bs_api
 S src
 S test
 B _build/**
