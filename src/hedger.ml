@@ -285,20 +285,21 @@ let rpc_server port =
   Rpc.Connection.serve implementations state_of_addr_conn (Tcp.on_port port) ()
 
 let main cfg port daemon pidfile logfile loglevel instruments () =
-  let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> presult_exn in
-  let { Cfg.key; secret } = List.Assoc.find_exn cfg "BFX" in
-  bfx_key := key;
-  bfx_secret := Cstruct.of_string secret;
-  let buf = Bi_outbuf.create 4096 in
-  if daemon then Daemon.daemonize ~cd:"." ();
-  set_output Log.Output.[stderr (); file `Text ~filename:logfile];
-  Log.set_output log_bfx Log.Output.[stderr (); file `Text ~filename:logfile];
-  set_level (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
-  Log.set_level log_bfx (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
-  Out_channel.write_all pidfile ~data:(Unix.getpid () |> Pid.to_string);
-  List.iter instruments ~f:(fun (i, q) -> subscribe i q);
-  don't_wait_for @@ bfx_ws buf;
-  don't_wait_for @@ Deferred.ignore @@ rpc_server port;
+  don't_wait_for begin
+    Lock_file.create_exn pidfile >>= fun () ->
+    let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> presult_exn in
+    let { Cfg.key; secret } = List.Assoc.find_exn cfg "BFX" in
+    bfx_key := key;
+    bfx_secret := Cstruct.of_string secret;
+    let buf = Bi_outbuf.create 4096 in
+    if daemon then Daemon.daemonize ~cd:"." ();
+    set_output Log.Output.[stderr (); file `Text ~filename:logfile];
+    Log.set_output log_bfx Log.Output.[stderr (); file `Text ~filename:logfile];
+    set_level (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
+    Log.set_level log_bfx (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
+    List.iter instruments ~f:(fun (i, q) -> subscribe i q);
+    Deferred.(all_unit [bfx_ws buf; ignore @@ rpc_server port])
+  end;
   never_returns @@ Scheduler.go ()
 
 let command =

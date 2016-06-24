@@ -502,6 +502,8 @@ let market_make buf instruments =
       List.map instruments ~f:(fun i -> "orderBookL2:" ^ i) @
       ["order"; "execution"; "margin"; "position"]
     in
+    don't_wait_for @@ dead_man's_switch 60000 15.;
+    after @@ Time.Span.of_ms 50. >>= fun () ->
     Ws.with_connection
       ~testnet:!testnet
       ~auth:(!api_key, !api_secret)
@@ -546,23 +548,26 @@ let rpc_client port =
   in loop ()
 
 let main cfg port daemon pidfile logfile loglevel main dry_run' instruments () =
-  dry_run := dry_run';
-  testnet := not main;
-  let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> presult_exn in
-  let { Cfg.key; secret; quote } = List.Assoc.find_exn cfg (if main then "BMEX" else "BMEXT") in
-  api_key := key;
-  api_secret := Cstruct.of_string secret;
-  let instruments = if instruments = [] then quote else instruments in
-  let buf = Bi_outbuf.create 4096 in
-  if daemon then Daemon.daemonize ~cd:"." ();
-  set_output Log.Output.[stderr (); file `Text ~filename:logfile];
-  set_level (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
-  Out_channel.write_all pidfile ~data:(Unix.getpid () |> Pid.to_string);
-  hedger_port := port;
-  List.iter instruments ~f:(fun (k, v) -> String.Table.set quoted_instruments ~key:k ~data:(create_instrument_info (Ivar.create ()) v ()));
-  don't_wait_for @@ dead_man's_switch 60000 15.;
-  don't_wait_for @@ Deferred.ignore @@ rpc_client port;
-  don't_wait_for @@ market_make buf @@ String.Table.keys quoted_instruments;
+  don't_wait_for begin
+    Lock_file.create_exn pidfile >>= fun () ->
+    dry_run := dry_run';
+    testnet := not main;
+    let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> presult_exn in
+    let { Cfg.key; secret; quote } = List.Assoc.find_exn cfg (if main then "BMEX" else "BMEXT") in
+    api_key := key;
+    api_secret := Cstruct.of_string secret;
+    let instruments = if instruments = [] then quote else instruments in
+    let buf = Bi_outbuf.create 4096 in
+    if daemon then Daemon.daemonize ~cd:"." ();
+    set_output Log.Output.[stderr (); file `Text ~filename:logfile];
+    set_level (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
+    hedger_port := port;
+    List.iter instruments ~f:(fun (k, v) -> String.Table.set quoted_instruments ~key:k ~data:(create_instrument_info (Ivar.create ()) v ()));
+    Deferred.(all_unit [
+        ignore @@ rpc_client port;
+        market_make buf @@ String.Table.keys quoted_instruments;
+      ]);
+  end;
   never_returns @@ Scheduler.go ()
 
 let command =
