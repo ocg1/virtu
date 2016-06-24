@@ -26,8 +26,15 @@ type order = { price: int; qty: int }
 let bfx_orders : (order Int.Table.t) String.Table.t = String.Table.create ()
 let bfx_bids : (Int.t Int.Map.t) String.Table.t = String.Table.create ()
 let bfx_asks : (Int.t Int.Map.t) String.Table.t = String.Table.create ()
+
+let bfx_book side symbol =
+  String.Table.find (match side with Side.Bid -> bfx_bids | _ -> bfx_asks) symbol
+
 let bfx_bid_vwaps : (int * int) String.Table.t = String.Table.create ()
 let bfx_ask_vwaps : (int * int) String.Table.t = String.Table.create ()
+
+let bfx_vwaps side symbol =
+  String.Table.find (match side with Side.Bid -> bfx_bid_vwaps | _ -> bfx_ask_vwaps) symbol
 
 let tickups_w = ref None
 
@@ -71,6 +78,27 @@ let on_bfx_book_partial sym os =
   String.Table.set bfx_asks sym asks;
   Log.debug log_bfx "Initialized BFX order books"
 
+let compute_vwaps sym side vwaps old_book new_book =
+  (* computation of VWAP *)
+  let vlimit = String.Table.find subscriptions sym in
+  let old_vwap = String.Table.find vwaps sym in
+  let new_vwap, total_v = vwap ?vlimit side new_book in
+  String.Table.set vwaps sym (new_vwap, total_v);
+  let best_elt_f = Int.Map.(match side with Side.Bid -> max_elt | Ask -> min_elt) in
+  let old_best_elt = Option.map ~f:fst @@ best_elt_f old_book in
+  let new_best_elt = Option.map ~f:fst @@ best_elt_f new_book in
+  begin match old_best_elt, new_best_elt, old_vwap with
+  | Some old_best, Some new_best, Some (old_vwap, _) when old_best <> new_best || old_vwap <> new_vwap ->
+    Option.iter !tickups_w ~f:(fun p ->
+        (try
+          Pipe.write_without_pushback p @@
+          Protocols.OrderBook.(Ticker (create_ticker ~symbol:sym ~side ~best:new_best ~vwap:new_vwap ()));
+        with _ -> tickups_w := None);
+        debug "-> tickup"
+      )
+  | _ -> ()
+  end
+
 let on_bfx_book_update sym { BFX.Ws.Book.Raw.id; price = new_price; amount = new_qty } =
   let book_add_qty book price qty =
     Int.Map.update book price ~f:(function None -> qty | Some oldq -> oldq + qty)
@@ -113,26 +141,7 @@ let on_bfx_book_update sym { BFX.Ws.Book.Raw.id; price = new_price; amount = new
       old_book
   in
   String.Table.set books sym new_book;
-
-  (* computation of VWAP *)
-  let vlimit = String.Table.find subscriptions sym in
-  let old_vwap = String.Table.find vwaps sym in
-  let new_vwap, total_v = vwap ?vlimit side new_book in
-  String.Table.set vwaps sym (new_vwap, total_v);
-  let best_elt_f = Int.Map.(match side with Side.Bid -> max_elt | Ask -> min_elt) in
-  let old_best_elt = Option.map ~f:fst @@ best_elt_f old_book in
-  let new_best_elt = Option.map ~f:fst @@ best_elt_f new_book in
-  begin match old_best_elt, new_best_elt, old_vwap with
-  | Some old_best, Some new_best, Some (old_vwap, _) when old_best <> new_best || old_vwap <> new_vwap ->
-    Option.iter !tickups_w ~f:(fun p ->
-        (try
-          Pipe.write_without_pushback p @@
-          Protocols.OrderBook.(Ticker (create_ticker ~symbol:sym ~side ~best:new_best ~vwap:new_vwap ()));
-        with _ -> tickups_w := None);
-        debug "-> tickup"
-      );
-    | _ -> ()
-  end
+  compute_vwaps sym side vwaps old_book new_book
 
 let subscribe_r, subscribe_w = Pipe.create ()
 
@@ -218,6 +227,22 @@ let subscribe sym max_pos =
      "prec", `String "R0"
     ] ()
 
+let push_initial_tickers w side symbol =
+  let best = match side with
+  | Side.Bid -> Int.Map.max_elt
+  | _ -> Int.Map.min_elt
+  in
+  let infos =
+    let open Option.Monad_infix in
+    bfx_book side symbol >>= fun book ->
+    bfx_vwaps side symbol >>= fun (vwap, _) ->
+    best book >>| fun best -> fst best, vwap
+  in
+  Option.iter infos ~f:(fun (best, vwap) ->
+      Pipe.write_without_pushback w @@
+      Protocols.OrderBook.(Ticker (create_ticker ~symbol ~side ~best ~vwap ()));
+    )
+
 let rpc_server port =
   let module P = Protocols in
   let orderbook_f state query =
@@ -233,6 +258,10 @@ let rpc_server port =
       List.iter symbols ~f:handle_sub;
       Option.iter !tickups_w ~f:Pipe.close;
       let r, w = Pipe.create () in
+      List.iter symbols ~f:(fun (s, _) ->
+          push_initial_tickers w Side.Bid s;
+          push_initial_tickers w Side.Ask s
+        );
       tickups_w := Some w;
       Deferred.Or_error.return r
     | Unsubscribe symbols ->
