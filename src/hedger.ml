@@ -207,9 +207,9 @@ let bfx_ws buf =
           let sym = of_remote_sym pair in
           begin match updates with
             | [] -> ()
-            | [u] ->
-                (* debug "<- %s" @@ Ws.Book.Raw.show u; *)
-                on_bfx_book_update sym u
+            | [{ id; price; amount } as u] ->
+              (* debug "<- ob %s %d %.2f %.3f" sym id price amount; *)
+              on_bfx_book_update sym u
             | partial -> on_bfx_book_partial sym partial
           end
         | _ -> ()

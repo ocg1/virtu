@@ -26,7 +26,20 @@ let orders : RespObj.t Uuid.Table.t = Uuid.Table.create ()
 let executions : RespObj.t Uuid.Table.t = Uuid.Table.create ()
 let margin = ref @@ RespObj.of_json (`Assoc [])
 let positions : RespObj.t String.Table.t = String.Table.create ()
-let ticksizes : int String.Table.t = String.Table.create ()
+let ticksizes : (Float.t * Int.t) String.Table.t = String.Table.create ()
+
+let best_of_side = function
+| Side.Bid -> Int.Map.max_elt
+| Ask -> Int.Map.min_elt
+
+let digits_of_tickSize tickSize =
+  let ts_str = Printf.sprintf "%.0e" tickSize in
+  let e = String.index_exn ts_str 'e' in
+  let exponent = String.(sub ts_str (e+2) (length ts_str - e - 2)) |> Int.of_string in
+  match String.get ts_str (e+1) with
+  | '+' -> exponent
+  | '-' -> Int.neg exponent
+  | _ -> invalid_arg "digits_of_tickSize"
 
 let current_bids : Uuid.t String.Table.t = String.Table.create ()
 let current_asks : Uuid.t String.Table.t = String.Table.create ()
@@ -36,7 +49,7 @@ let current_orders = function
   | Ask -> current_asks
 
 module RemoteOB = struct
-  type ticker = { best: int; vwap: int }
+  type ticker = { best: int; vwap: int } [@@deriving create]
 
   let best_bids : ticker String.Table.t = String.Table.create ()
   let best_asks : ticker String.Table.t = String.Table.create ()
@@ -52,6 +65,7 @@ module RemoteOB = struct
           let midPrice = (bb + ba) / 2 in
           midPrice, ba - midPrice
         | `Vwap ->
+          debug "RemoteOB.mid_price %s %d %d" symbol vb va;
           let midPrice = (vb + va) / 2 in
           midPrice, va - midPrice
       )
@@ -66,7 +80,7 @@ module OB = struct
   let book_of_side = function Side.Bid -> bids | Ask -> asks
 
   let best_price side symbol =
-    Option.Monad_infix.(String.Table.find (book_of_side side) symbol >>= Int.Map.max_elt)
+    Option.Monad_infix.(String.Table.find (book_of_side side) symbol >>= best_of_side side)
 
   type vwap = {
     max_pos_p: int;
@@ -179,33 +193,36 @@ let mk_new_market_order ~symbol ~qty : Yojson.Safe.json =
     "ordType", `String "Market";
   ]
 
+let price_of_satoshis symbol price =
+  let multiplier, nbDigits = String.Table.find_exn ticksizes symbol in
+  let price = price / Int.(pow 10 (8 + nbDigits)) in
+  Float.of_int price *. multiplier
+
 let mk_new_limit_order ~symbol ~side ~price ~qty : Yojson.Safe.json =
-  let price = Float.of_int price /. 1e8 in
   `Assoc [
     "clOrdID", `String Uuid.(create () |> to_string);
     "symbol", `String symbol;
-    "side", `String (bmex_of_buy_sell side);
-    "price", `Float price;
+    "side", `String (match side with Side.Bid -> "Buy" | Ask -> "Sell");
+    "price", `Float (price_of_satoshis symbol price);
     "orderQty", `Int qty;
     "execInst", `String "ParticipateDoNotInitiate"
   ]
 
-let mk_amended_limit_order ?price ?qty orderID : Yojson.Safe.json =
-  let price = Option.map price ~f:(fun price -> Float.of_int price /. 1e8) in
+let mk_amended_limit_order ?price ?qty ~symbol orderID : Yojson.Safe.json =
   `Assoc (List.filter_opt [
     Some ("orderID", `String orderID);
     Option.map qty ~f:(fun qty -> "leavesQty", `Int qty);
-    Option.map price ~f:(fun price -> "price", `Float price);
+    Option.map price ~f:(fun price -> "price", `Float (price_of_satoshis symbol price));
     ])
 
 let compute_orders symbol side price order newQty =
   let orderID = Option.map order ~f:(fun o -> RespObj.string_exn o "orderID") in
   let leavesQty = Option.value_map ~default:0 order ~f:(fun o -> RespObj.int64_exn o "leavesQty" |> Int64.to_int_exn) in
-  debug "compute_orders %s %d %d %d" symbol price leavesQty newQty;
+  debug "compute_orders %s %s %d %d %d" symbol (Side.show side) price leavesQty newQty;
   match leavesQty, newQty with
   | 0, 0 -> [], []
   | 0, qty -> [mk_new_limit_order ~symbol ~side ~price ~qty], []
-  | qty, qty' -> [], [mk_amended_limit_order ~price ~qty:qty' Option.(value_exn orderID)]
+  | qty, qty' -> [], [mk_amended_limit_order ~symbol ~price ~qty:qty' Option.(value_exn orderID)]
 
 let on_position_update (symbol: string) p oldp =
   let { max_pos_size } = String.Table.find_exn quoted_instruments symbol in
@@ -230,8 +247,8 @@ let on_position_update (symbol: string) p oldp =
       if currentBidQty <> newBidQty || currentAskQty <> newAskQty then begin
         info "Updating orders to match current position: bid_qty=%d ask_qty=%d" newBidQty newAskQty;
         info "Found bid: %b, ask: %b" (Option.is_some bidOrderID) (Option.is_some askOrderID);
-        let bidSubmit, bidAmend = compute_orders symbol `Buy bidPrice bidOrder newBidQty in
-        let askSubmit, askAmend = compute_orders symbol `Sell askPrice askOrder newAskQty in
+        let bidSubmit, bidAmend = compute_orders symbol Bid bidPrice bidOrder newBidQty in
+        let askSubmit, askAmend = compute_orders symbol Ask askPrice askOrder newAskQty in
         let submit = bidSubmit @ askSubmit in
         let amend = bidAmend @ askAmend in
         if submit <> [] then don't_wait_for @@ Deferred.ignore @@ Order.submit submit;
@@ -244,41 +261,30 @@ let on_position_update (symbol: string) p oldp =
     | None, _ ->
       info "on_position_update: waiting for %s orderBookL2" symbol
 
+let update_order_on_ticker_update symbol side dprice =
+  let oid = String.Table.find (current_orders side) symbol in
+  let order = Option.bind oid (Uuid.Table.find orders) in
+  let order = Option.bind order (fun order ->
+      RespObj.(Option.bind
+                 (bool order "workingIndicator")
+                 (function true -> Some order | false -> None)
+              )
+    )
+  in
+  Order.update @@ List.filter_opt [
+    Option.map order ~f:(fun o ->
+        let oid = RespObj.string_exn o "orderID" in
+        let old_price = satoshis_int_of_float_exn @@ RespObj.float_exn o "price" in
+        let new_price = old_price + dprice in
+        info "update order %s %s id=%s oldp=%d newp=%d"
+          symbol (Side.show side) oid old_price new_price;
+        mk_amended_limit_order ~symbol ~price:new_price oid);
+  ]
+
 let on_ticker_update { Protocols.OrderBook.symbol; side; best; vwap } =
   debug "<- tickup %s %s %d %d" symbol (Side.show side) best vwap;
   let rtickers = RemoteOB.tickers side in
-  match String.Table.find_or_add ~default:(fun () -> { best; vwap }) rtickers symbol with
-  | { vwap=old_vwap } when old_vwap <> vwap -> begin
-      String.Table.set rtickers symbol { best; vwap };
-      let dvwap = vwap - old_vwap in
-      match OB.best_price side symbol with
-      | None -> Deferred.unit (* begin *)
-        (*   let buy_sell = match side with Bid -> `Buy | Ask -> `Sell in *)
-        (*   let qty = String.Table.find_exn quoted_instruments symbol in *)
-        (*   Order.submit @@ [mk_new_limit_order ~symbol ~side:buy_sell ~price:vwap ~qty] >>| function *)
-        (*   | Ok _ -> info "on_quote_change: update %s %s %d" symbol (Side.show side) vwap *)
-        (*   | Error err -> error "%s" @@ Error.to_string_hum err *)
-        (* end *)
-      | Some _ ->
-        let oid = String.Table.find (current_orders side) symbol in
-        let order = Option.bind oid (Uuid.Table.find orders) in
-        let order = Option.bind order (fun order ->
-            RespObj.(Option.bind
-                       (bool order "workingIndicator")
-                       (function true -> Some order | false -> None)
-                    )
-          )
-        in
-        Order.update @@ List.filter_opt [
-          Option.map order ~f:(fun o ->
-              let oid = RespObj.string_exn o "orderID" in
-              let old_price = satoshis_int_of_float_exn @@ RespObj.float_exn o "price" in
-              let new_price = old_price + dvwap in
-              mk_amended_limit_order ~price:new_price oid);
-        ] >>| fun () ->
-        info "on_quote_change: update %s %s %d" symbol (Side.show side) vwap
-    end
-  | _ -> Deferred.unit
+  String.Table.set rtickers symbol (RemoteOB.create_ticker ~best ~vwap ())
 
 let instruments_initialized = Ivar.create ()
 let orders_initialized = Ivar.create ()
@@ -290,7 +296,7 @@ let on_instrument action data =
     let i = RespObj.of_json i in
     let sym = RespObj.string_exn i "symbol" in
     String.Table.set instruments sym i;
-    String.Table.set ticksizes ~key:sym ~data:(RespObj.float_exn i "tickSize" |> satoshis_int_of_float_exn);
+    String.Table.set ticksizes ~key:sym ~data:(RespObj.float_exn i "tickSize" |> fun tickSize -> tickSize, digits_of_tickSize tickSize);
     String.Table.set OB.orders sym (Int.Table.create ());
     String.Table.set OB.bids sym (Int.Map.empty);
     String.Table.set OB.asks sym (Int.Map.empty)
@@ -545,7 +551,6 @@ let rpc_client port =
   let on_msg = function
   | OrderBook.Subscribed (sym, max_pos) ->
     info "hedger subscribed to %s %d" sym max_pos;
-    Deferred.unit
   | Ticker t -> on_ticker_update t
   in
   let client_f c =
@@ -568,7 +573,7 @@ let rpc_client port =
       List.iter quoted_instrs ~f:(fun (sym, xbt_v) ->
           debug "-> [RPC] subscribe %s %d" sym xbt_v
         );
-      Pipe.iter feed ~f:on_msg
+      Pipe.iter_without_pushback feed ~f:on_msg
     | Ok (Error err) ->
       error "[RPC] dispatch returned error: %s" (Error.to_string_hum err);
       Deferred.unit
