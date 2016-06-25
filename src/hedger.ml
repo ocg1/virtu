@@ -28,13 +28,13 @@ let bfx_bids : (Int.t Int.Map.t) String.Table.t = String.Table.create ()
 let bfx_asks : (Int.t Int.Map.t) String.Table.t = String.Table.create ()
 
 let bfx_book side symbol =
-  String.Table.find (match side with Side.Bid -> bfx_bids | _ -> bfx_asks) symbol
+  String.Table.find (match side with Side.Bid -> bfx_bids | Ask -> bfx_asks) symbol
 
 let bfx_bid_vwaps : (int * int) String.Table.t = String.Table.create ()
 let bfx_ask_vwaps : (int * int) String.Table.t = String.Table.create ()
 
 let bfx_vwaps side symbol =
-  String.Table.find (match side with Side.Bid -> bfx_bid_vwaps | _ -> bfx_ask_vwaps) symbol
+  String.Table.find (match side with Side.Bid -> bfx_bid_vwaps | Ask -> bfx_ask_vwaps) symbol
 
 let tickups_w = ref None
 
@@ -82,19 +82,20 @@ let compute_vwaps sym side vwaps old_book new_book =
   (* computation of VWAP *)
   let vlimit = String.Table.find subscriptions sym in
   let old_vwap = String.Table.find vwaps sym in
-  let new_vwap, total_v = vwap ?vlimit side new_book in
+  let new_vp, total_v = vwap ?vlimit side new_book in
+  let new_vwap = new_vp / total_v in
   String.Table.set vwaps sym (new_vwap, total_v);
   let best_elt_f = Int.Map.(match side with Side.Bid -> max_elt | Ask -> min_elt) in
   let old_best_elt = Option.map ~f:fst @@ best_elt_f old_book in
   let new_best_elt = Option.map ~f:fst @@ best_elt_f new_book in
   begin match old_best_elt, new_best_elt, old_vwap with
   | Some old_best, Some new_best, Some (old_vwap, _) when old_best <> new_best || old_vwap <> new_vwap ->
+    debug "-> tickup %s %s %d %d" sym (Side.show side) new_best new_vwap;
     Option.iter !tickups_w ~f:(fun p ->
         (try
           Pipe.write_without_pushback p @@
           Protocols.OrderBook.(Ticker (create_ticker ~symbol:sym ~side ~best:new_best ~vwap:new_vwap ()));
         with _ -> tickups_w := None);
-        debug "-> tickup"
       )
   | _ -> ()
   end
@@ -215,8 +216,8 @@ let bfx_ws buf =
   in
   Ws.with_connection ~log:(Lazy.force log) ~auth:(!bfx_key, !bfx_secret) ~to_ws:subscribe_r ~on_ws_msg ()
 
-let subscribe sym max_pos =
-  String.Table.set subscriptions sym max_pos;
+let subscribe sym xbt_v =
+  String.Table.set subscriptions sym xbt_v;
   String.Table.set bfx_orders sym (Int.Table.create ());
   String.Table.set bfx_bids sym (Int.Map.empty);
   String.Table.set bfx_asks sym (Int.Map.empty);
@@ -230,7 +231,7 @@ let subscribe sym max_pos =
 let push_initial_tickers w side symbol =
   let best = match side with
   | Side.Bid -> Int.Map.max_elt
-  | _ -> Int.Map.min_elt
+  | Ask -> Int.Map.min_elt
   in
   let infos =
     let open Option.Monad_infix in
@@ -248,12 +249,14 @@ let rpc_server port =
   let orderbook_f state query =
     match query with
     | P.OrderBook.Subscribe symbols ->
-      debug "RPC <- Subscribe";
-      let handle_sub (sym, max_pos) =
+      List.iter symbols ~f:(fun (sym, xbt_v) ->
+          debug "<- [RPC] Subscribe %s %d" sym xbt_v
+        );
+      let handle_sub (sym, xbt_v) =
         let open Rpc.Pipe_rpc in
         match String.Table.find subscriptions sym with
-        | Some _ -> String.Table.set subscriptions sym max_pos
-        | None -> subscribe sym max_pos
+        | Some _ -> String.Table.set subscriptions sym xbt_v
+        | None -> subscribe sym xbt_v
       in
       List.iter symbols ~f:handle_sub;
       Option.iter !tickups_w ~f:Pipe.close;
@@ -266,7 +269,7 @@ let rpc_server port =
       Deferred.Or_error.return r
     | Unsubscribe symbols ->
       (* TODO: Unsubscribe *)
-      debug "RPC <- Unsubscribe";
+      List.iter symbols ~f:(debug "<- [RPC] Unsubscribe %s");
       List.iter symbols ~f:(String.Table.remove subscriptions);
       Option.iter !tickups_w ~f:Pipe.close;
       Deferred.Or_error.return @@ Pipe.of_list []

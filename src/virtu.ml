@@ -14,13 +14,13 @@ let dry_run = ref false
 let hedger_port = ref 0
 
 type instrument_info = {
-  ob_initialized: unit Ivar.t;
+  bids_initialized: unit Ivar.t;
+  asks_initialized: unit Ivar.t;
   max_pos_size: int;
 } [@@deriving create]
 
 let quoted_instruments : instrument_info String.Table.t = String.Table.create ()
 
-let quotes : Quote.t String.Table.t = String.Table.create ()
 let instruments : RespObj.t String.Table.t = String.Table.create ()
 let orders : RespObj.t Uuid.Table.t = Uuid.Table.create ()
 let executions : RespObj.t Uuid.Table.t = Uuid.Table.create ()
@@ -68,8 +68,13 @@ module OB = struct
   let best_price side symbol =
     Option.Monad_infix.(String.Table.find (book_of_side side) symbol >>= Int.Map.max_elt)
 
-  let bid_vwaps : Int.t String.Table.t = String.Table.create ()
-  let ask_vwaps : Int.t String.Table.t = String.Table.create ()
+  type vwap = {
+    max_pos_p: int;
+    total_v: int;
+  } [@@deriving create]
+
+  let bid_vwaps : vwap String.Table.t = String.Table.create ()
+  let ask_vwaps : vwap String.Table.t = String.Table.create ()
   let vwaps_of_side = function Side.Bid -> bid_vwaps | Ask -> ask_vwaps
 
   let vwap side symbol =
@@ -87,10 +92,23 @@ module OB = struct
     | `Vwap ->
       let vwap_bid = vwap Side.Bid symbol in
       let vwap_ask = vwap Ask symbol in
-      Option.map2 vwap_bid vwap_ask (fun vb va ->
-          let midPrice = (vb + va) / 2 in
-          midPrice, va - midPrice
+      Option.map2 vwap_bid vwap_ask
+        (fun { max_pos_p=mp; total_v=tv } { max_pos_p=mp'; total_v=tv' } ->
+           let vb = mp / tv in
+           let va = mp' / tv' in
+           let midPrice = (vb + va) / 2 in
+           midPrice, va - midPrice
         )
+
+  let xbt_value sym = match sym with
+  | "XBTUSD" ->
+    Option.map (mid_price sym `Vwap)
+      ~f:(fun (midPrice, _) -> 10_000_000_000_000_000 / midPrice)
+  | "ETHXBT" -> Option.map ~f:fst @@ mid_price sym `Vwap
+  | "LTCXBT" -> Option.map ~f:fst @@ mid_price sym `Vwap
+  | "LSKXBT" -> Option.map ~f:fst @@ mid_price sym `Vwap
+  | "FCTXBT" -> Option.map ~f:fst @@ mid_price sym `Vwap
+  | _ -> invalid_arg "xbt_value"
 end
 
 module Order = struct
@@ -128,7 +146,7 @@ module Order = struct
 
   let cancel_all ?symbol ?filter () =
     if !dry_run then begin
-      info "[Sim] cancel all";
+      info "[Sim] cancel_all";
       Deferred.Or_error.return ""
     end
     else
@@ -136,7 +154,7 @@ module Order = struct
 
   let cancel_all_after timeout =
     if !dry_run then begin
-      info "[Sim] cancel all";
+      info "[Sim] cancel_all_after";
       Deferred.unit
     end
     else
@@ -227,7 +245,7 @@ let on_position_update (symbol: string) p oldp =
       info "on_position_update: waiting for %s orderBookL2" symbol
 
 let on_ticker_update { Protocols.OrderBook.symbol; side; best; vwap } =
-  debug "<- tickup";
+  debug "<- tickup %s %s %d %d" symbol (Side.show side) best vwap;
   let rtickers = RemoteOB.tickers side in
   match String.Table.find_or_add ~default:(fun () -> { best; vwap }) rtickers symbol with
   | { vwap=old_vwap } when old_vwap <> vwap -> begin
@@ -385,7 +403,6 @@ let on_position action data =
   | _ -> List.iter data ~f:on_update
 
 let on_orderbook action data =
-  debug "<- %s %s" (show_update_action action) @@ Yojson.Safe.to_string (`List data);
   let action_str = show_update_action action in
   let of_json json =
     match OrderBook.L2.of_yojson json with
@@ -446,20 +463,32 @@ let on_orderbook action data =
   let data = List.group data ~break:(fun u u' -> u.OrderBook.L2.symbol <> u'.symbol || u.side <> u'.side) in
   let iter_f = function
   | (h :: t) as us when String.Table.mem quoted_instruments h.OrderBook.L2.symbol ->
-    begin if action = Partial then
-      let { ob_initialized } = String.Table.find_exn quoted_instruments h.symbol in
-      Ivar.fill_if_empty ob_initialized ()
-    end;
+    let side, best_elt, books, vwaps = match buy_sell_of_bmex h.OrderBook.L2.side with
+    | `Buy -> Side.Bid, Int.Map.max_elt, OB.bids, OB.bid_vwaps
+    | `Sell -> Ask, Int.Map.min_elt, OB.asks, OB.ask_vwaps
+    in
     let { max_pos_size } = String.Table.find_exn quoted_instruments h.symbol in
-    let side = buy_sell_of_bmex h.OrderBook.L2.side in
-    let books = match side with `Buy -> OB.bids | `Sell -> OB.asks in
     let old_book = String.Table.find_exn books h.symbol in
     let new_book = List.fold_left us ~init:old_book ~f:(update_depth action) in
     String.Table.set books h.symbol new_book;
-    let side = match side with `Buy -> Side.Bid | `Sell -> Ask in
-    let vwap, total_v = vwap ~vlimit:max_pos_size side new_book in
-    let side_str = Side.show side in
-    info "BMEX %s %s vwap=%.2f totalv=%d" h.symbol side_str (Float.of_int vwap /. Float.of_int total_v *. 1e-8) total_v
+
+    (* compute vwap *)
+    let max_pos_p, total_v = vwap ~vlimit:max_pos_size side new_book in
+    String.Table.set vwaps ~key:h.symbol ~data:(OB.create_vwap ~max_pos_p ~total_v ());
+    info "BMEX %s %s best=%d vwap=%d totalv=%d"
+      h.symbol (Side.show side)
+      (Option.value_map (best_elt new_book) ~default:0 ~f:(fun (v, _) -> v))
+      (max_pos_p / total_v)
+      total_v;
+
+    if action = Partial then begin
+      debug "%s %s initialized" h.symbol (Side.show side);
+      let { bids_initialized; asks_initialized } = String.Table.find_exn quoted_instruments h.symbol in
+      match side with
+      | Bid -> Ivar.fill_if_empty bids_initialized ()
+      | Ask -> Ivar.fill_if_empty asks_initialized ()
+    end
+
   | _ -> ()
   in
   don't_wait_for begin
@@ -495,8 +524,8 @@ let market_make buf instruments =
     let err_str = Error.to_string_hum err in
     error "%s" err_str;
     failwith err_str
-  | Ok msg ->
-    info "all orders canceled: %s" msg;
+  | Ok _ ->
+    info "all orders canceled";
     let topics =
       "instrument" ::
       List.map instruments ~f:(fun i -> "orderBookL2:" ^ i) @
@@ -520,20 +549,31 @@ let rpc_client port =
   | Ticker t -> on_ticker_update t
   in
   let client_f c =
-    let quoted_instrs = String.Table.fold quoted_instruments ~init:[]
-        ~f:(fun ~key:k ~data:{ max_pos_size } a ->
-            (k, max_pos_size) :: a
-          )
+    let quoted_instrs = String.Table.to_alist quoted_instruments in
+    Deferred.List.iter quoted_instrs
+      ~f:(fun (sym, { bids_initialized; asks_initialized }) ->
+          Deferred.all_unit @@ Ivar.[read bids_initialized;
+                                     read asks_initialized]
+        )
+    >>= fun () ->
+    let quoted_instrs =
+    List.filter_map quoted_instrs ~f:(fun (sym, { max_pos_size }) ->
+        Option.map (OB.xbt_value sym)
+          ~f:(fun xbt_v -> sym, max_pos_size * xbt_v)
+        )
     in
     Pipe_rpc.dispatch OrderBook.t c
       (OrderBook.Subscribe quoted_instrs) >>= function
     | Ok (Ok (feed, meta)) ->
+      List.iter quoted_instrs ~f:(fun (sym, xbt_v) ->
+          debug "-> [RPC] subscribe %s %d" sym xbt_v
+        );
       Pipe.iter feed ~f:on_msg
     | Ok (Error err) ->
-      error "dispatch returned error: %s" (Error.to_string_hum err);
+      error "[RPC] dispatch returned error: %s" (Error.to_string_hum err);
       Deferred.unit
     | Error err ->
-      error "dispatch raised: %s" Error.(to_string_hum err);
+      error "[RPC] dispatch raised: %s" Error.(to_string_hum err);
       Deferred.unit
   in
   let rec loop () =
@@ -562,7 +602,10 @@ let main cfg port daemon pidfile logfile loglevel main dry_run' instruments () =
     set_output Log.Output.[stderr (); file `Text ~filename:logfile];
     set_level (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
     hedger_port := port;
-    List.iter instruments ~f:(fun (k, v) -> String.Table.set quoted_instruments ~key:k ~data:(create_instrument_info (Ivar.create ()) v ()));
+    List.iter instruments ~f:(fun (k, v) ->
+        String.Table.set quoted_instruments ~key:k
+          ~data:Ivar.(create_instrument_info (create ()) (create ()) v ())
+      );
     Deferred.(all_unit [
         ignore @@ rpc_client port;
         market_make buf @@ String.Table.keys quoted_instruments;
