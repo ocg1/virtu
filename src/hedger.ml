@@ -4,8 +4,8 @@ open Core.Std
 open Async.Std
 open Log.Global
 
+open Util
 open Bs_devkit.Core
-
 open Bs_api
 
 let log_bfx = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
@@ -90,7 +90,7 @@ let compute_vwaps sym side vwaps old_book new_book =
   let new_best_elt = Option.map ~f:fst @@ best_elt_f new_book in
   begin match old_best_elt, new_best_elt, old_vwap with
   | Some old_best, Some new_best, Some (old_vwap, _) when old_best <> new_best || old_vwap <> new_vwap ->
-    debug "-> tickup %s %s %d %d" sym (Side.show side) new_best new_vwap;
+    Log.debug log_bfx "-> tickup %s %s %d %d" sym (Side.show side) (new_best / 1_000_000) (new_vwap / 1_000_000);
     Option.iter !tickups_w ~f:(fun p ->
         (try
           Pipe.write_without_pushback p @@
@@ -122,24 +122,23 @@ let on_bfx_book_update sym { BFX.Ws.Book.Raw.id; price = new_price; amount = new
       Some (satoshis_int_of_float_exn new_price),
       Some (bps_int_of_float_exn new_qty)
   in
-  (* Log.debug log_bfx "<- %d %d %d" id (Option.value ~default:0 new_price) (Option.value ~default:0 new_qty); *)
-  let abs_new_qty = Option.map new_qty Int.abs in
+  (* Log.debug log_bfx "<- %d %d %d" id (Option.value ~default:0 new_price / 1_000_000) (Option.value ~default:0 new_qty); *)
   let action = if Option.is_none new_price then BMEX.Delete else Insert in
   let old_book = String.Table.find_exn books sym in
-  let new_book = match action, new_price, abs_new_qty, Int.Table.find orders id with
-    | Delete, None, None, Some { price = old_price; qty = old_qty } ->
-      Int.Table.remove orders id;
-      book_modify_qty old_book old_price (Int.neg old_qty)
-    | Insert, Some newp, Some newq, None ->
-      Int.Table.set orders id { price = newp; qty = Option.value_exn new_qty };
-      book_add_qty old_book newp newq
-    | Insert, Some newp, Some newq, Some { price = old_price; qty = old_qty } ->
-      Int.Table.set orders id { price = newp; qty = Option.value_exn new_qty };
-      let intermediate_book = book_modify_qty old_book old_price (Int.neg newq) in
-      book_modify_qty intermediate_book newp newq
-    | _ ->
-      Log.error log_bfx "Our internal orderbook is inconsistent with a BFX update!";
-      old_book
+  let new_book = match action, new_price, new_qty, Int.Table.find orders id with
+  | Delete, None, None, Some { price = oldp; qty = oldq } ->
+    Int.Table.remove orders id;
+    book_modify_qty old_book oldp (set_sign Neg oldq)
+  | Insert, Some newp, Some newq, None ->
+    Int.Table.set orders id { price = newp; qty = newq };
+    book_add_qty old_book newp (set_sign Pos newq)
+  | Insert, Some newp, Some newq, Some { price = oldp; qty = oldq } ->
+    Int.Table.set orders id { price = newp; qty = newq };
+    let intermediate_book = book_modify_qty old_book oldp (set_sign Neg oldq) in
+    book_modify_qty intermediate_book newp (set_sign Pos newq)
+  | _ ->
+    Log.error log_bfx "Our internal orderbook is inconsistent with a BFX update!";
+    old_book
   in
   String.Table.set books sym new_book;
   compute_vwaps sym side vwaps old_book new_book
@@ -207,9 +206,7 @@ let bfx_ws buf =
           let sym = of_remote_sym pair in
           begin match updates with
             | [] -> ()
-            | [{ id; price; amount } as u] ->
-              (* debug "<- ob %s %d %.2f %.3f" sym id price amount; *)
-              on_bfx_book_update sym u
+            | [u] -> on_bfx_book_update sym u
             | partial -> on_bfx_book_partial sym partial
           end
         | _ -> ()
