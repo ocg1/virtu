@@ -256,10 +256,11 @@ let on_position_update (symbol: string) p oldp =
   if currentQty <> oldQty || Option.is_none bidOrderID || Option.is_none askOrderID then
     let fw_p_to_hedger c = Rpc.Rpc.dispatch Protocols.Position.t c (symbol, currentQty) in
     don't_wait_for @@ Deferred.ignore @@ Rpc.Connection.with_client ~host:"localhost" ~port:!hedger_port fw_p_to_hedger;
+    let { divisor } = String.Table.find_exn ticksizes symbol in
     match OB.mid_price symbol Best, RemoteOB.mid_price symbol Vwap with
     | Some (midPrice, spread), Some (rMidPrice, rSpread) ->
       info "on_position_update: %d %d %d %d"
-        (midPrice / 1_000_000) (spread / 1_000_000) (rMidPrice / 1_000_000) (rSpread / 1_000_000);
+        (midPrice / divisor) (spread / divisor) (rMidPrice / divisor) (rSpread / divisor);
       let { divisor } = String.Table.find_exn ticksizes symbol in
       let rSpread = Int.(max divisor (min spread rSpread)) in
       let bidPrice = midPrice - rSpread in
@@ -281,7 +282,7 @@ let on_position_update (symbol: string) p oldp =
         if amend <> [] then don't_wait_for @@ Deferred.ignore @@ Order.update amend
       end
     | Some (midPrice, spread), None ->
-      info "on_position_update: %d %d" (midPrice / 1_000_000) (spread / 1_000_000)
+      info "on_position_update: %d %d" (midPrice / divisor) (spread / divisor)
     | None, _ ->
       info "on_position_update: waiting for %s orderBookL2" symbol
 
@@ -510,10 +511,11 @@ let on_orderbook action data =
     let max_pos_p, total_v = vwap ~vlimit:max_pos_size side new_book in
     String.Table.set vwaps ~key:h.symbol ~data:(OB.create_vwap ~max_pos_p ~total_v ());
     if total_v > 0 then
+      let { divisor } = String.Table.find_exn ticksizes h.symbol in
       info "BMEX %s %s %d %d %d"
         h.symbol (Side.show side)
-        (Option.value_map (best_elt_f new_book) ~default:0 ~f:(fun (v, _) -> v / 1_000_000))
-        (max_pos_p / total_v / 1_000_000)
+        (Option.value_map (best_elt_f new_book) ~default:0 ~f:(fun (v, _) -> v / divisor))
+        (max_pos_p / total_v / divisor)
         total_v;
 
     if action = Partial then begin
