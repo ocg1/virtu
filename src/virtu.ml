@@ -12,14 +12,10 @@ let api_key = ref ""
 let api_secret = ref @@ Cstruct.of_string ""
 let testnet = ref true
 let dry_run = ref false
-let hedger_port = ref 0
 
-type instrument_info = {
-  bids_initialized: unit Ivar.t;
-  asks_initialized: unit Ivar.t;
-  max_pos_size: int;
-  update_period: int; (* in ms *)
-} [@@deriving create]
+let order_cfg = ref @@ Order.create_cfg ()
+
+let hedger_port = ref 0
 
 let quoted_instruments : instrument_info String.Table.t = String.Table.create ()
 
@@ -40,33 +36,7 @@ let orders_initialized = Ivar.create ()
 let bid_set = Ivar.create ()
 let ask_set = Ivar.create ()
 
-type ticksize = {
-  multiplier: Float.t; (* i.e. 0.01 *)
-  mult_exponent: Int.t; (* 0.01 -> -2 *)
-  divisor: Int.t; (* i.e. 1_000_000 *)
-} [@@deriving create]
-
 let ticksizes : ticksize String.Table.t = String.Table.create ()
-
-let best_of_side = function
-| Side.Bid -> Int.Map.max_elt
-| Ask -> Int.Map.min_elt
-
-let exponent_divisor_of_tickSize tickSize =
-  let ts_str = Printf.sprintf "%.0e" tickSize in
-  let e = String.index_exn ts_str 'e' in
-  let exponent = String.(sub ts_str (e+2) (length ts_str - e - 2)) |> Int.of_string in
-  let exponent = match String.get ts_str (e+1) with
-  | '+' -> exponent
-  | '-' -> Int.neg exponent
-  | _ -> invalid_arg "digits_of_tickSize"
-  in
-  exponent, Int.(pow 10 (8 + exponent))
-
-let float_of_satoshis symbol price =
-  let { multiplier; mult_exponent; divisor } = String.Table.find_exn ticksizes symbol in
-  let res = Printf.sprintf "%.*f" (Int.neg mult_exponent) (Float.of_int (price / divisor) *. multiplier) in
-  Float.of_string res
 
 let current_bids : Uuid.t String.Table.t = String.Table.create ()
 let current_asks : Uuid.t String.Table.t = String.Table.create ()
@@ -74,8 +44,6 @@ let current_asks : Uuid.t String.Table.t = String.Table.create ()
 let current_orders = function
   | Side.Bid -> current_bids
   | Ask -> current_asks
-
-type ticker_kind = Best | Vwap
 
 module RemoteOB = struct
   type ticker = { best: int; vwap: int } [@@deriving create]
@@ -152,100 +120,34 @@ module OB = struct
   | _ -> invalid_arg "xbt_value"
 end
 
-module Order = struct
-  let submit orders =
-    if orders = [] then Deferred.Or_error.error_string "no orders submitted"
-    else if !dry_run then
-      Deferred.Or_error.return @@
-        Printf.sprintf "[Sim] submitted %s" Yojson.Safe.(to_string @@ `List orders)
-    else
-    Monitor.try_with_or_error ~name:"Order.submit" (fun () ->
-        Rest.Order.submit ~testnet:!testnet ~log:Lazy.(force log)
-          ~key:!api_key ~secret:!api_secret orders
-      )
-
-  let update orders =
-    if orders = [] then Deferred.Or_error.error_string "no orders submitted"
-    else if !dry_run then
-      Deferred.Or_error.return @@
-      Printf.sprintf "[Sim] updated %s" Yojson.Safe.(to_string @@ `List orders)
-    else
-    Monitor.try_with_or_error ~name:"Order.update" (fun () ->
-        Rest.Order.update ~testnet:!testnet ~log:Lazy.(force log)
-          ~key:!api_key ~secret:!api_secret orders
-      )
-
-  let cancel orderID =
-    if !dry_run then
-      Deferred.Or_error.return @@
-      Printf.sprintf "[Sim] canceled %s" @@ Uuid.to_string orderID
-    else
-    Monitor.try_with_or_error ~name:"Order.cancel" (fun () ->
-        Rest.Order.cancel ~testnet:!testnet ~log:Lazy.(force log)
-          ~key:!api_key ~secret:!api_secret orderID
-      )
-
-  let cancel_all ?symbol ?filter () =
-    if !dry_run then
-      Deferred.Or_error.return "[Sim] canceled all orders"
-    else
-    Monitor.try_with_or_error ~name:"Order.cancel_all" (fun () ->
-        Rest.Order.cancel_all ~testnet:!testnet ~log:Lazy.(force log)
-          ~key:!api_key ~secret:!api_secret ?symbol ?filter ()
-      )
-
-  let cancel_all_after timeout =
-    if !dry_run then
-      Deferred.Or_error.return @@
-      Printf.sprintf "[Sim] cancel all after %d" timeout
-    else
-    Monitor.try_with_or_error ~name:"Order.cancel_all_after" (fun () ->
-        Rest.Order.cancel_all_after ~testnet:!testnet ~log:Lazy.(force log)
-          ~key:!api_key ~secret:!api_secret timeout
-      )
-end
+module S = Strategy.FollowBFX(struct
+    let log = Lazy.(force log)
+    let order_cfg = lazy(!order_cfg)
+    let orders = orders
+    let current_orders = current_orders
+    let quoted_instruments = quoted_instruments
+    let ticksizes = ticksizes
+    let remote_ticker = RemoteOB.ticker
+  end)
 
 let dead_man's_switch timeout period =
   let rec loop () =
-    Order.cancel_all_after timeout >>= function
+    Order.cancel_all_after !order_cfg timeout >>= function
     | Error err ->
       error "%s" @@ Error.to_string_hum err;
       loop ()
     | Ok _ -> Clock_ns.after @@ Time_ns.Span.of_int_sec period >>= loop
   in loop ()
 
-let mk_new_market_order ~symbol ~qty : Yojson.Safe.json =
-  `Assoc [
-    "symbol", `String symbol;
-    "orderQty", `Int qty;
-    "ordType", `String "Market";
-  ]
-
-let mk_new_limit_order ~symbol ~side ~price ~qty : Yojson.Safe.json =
-  `Assoc [
-    "clOrdID", `String Uuid.(create () |> to_string);
-    "symbol", `String symbol;
-    "side", `String (match side with Side.Bid -> "Buy" | Ask -> "Sell");
-    "price", `Float (float_of_satoshis symbol price);
-    "orderQty", `Int qty;
-    "execInst", `String "ParticipateDoNotInitiate"
-  ]
-
-let mk_amended_limit_order ?price ?qty ~symbol orderID : Yojson.Safe.json =
-  `Assoc (List.filter_opt [
-    Some ("orderID", `String orderID);
-    Option.map qty ~f:(fun qty -> "leavesQty", `Int qty);
-    Option.map price ~f:(fun price -> "price", `Float (float_of_satoshis symbol price));
-    ])
-
 let compute_orders symbol side price order newQty =
   let orderID = Option.map order ~f:(fun o -> RespObj.string_exn o "orderID") in
   let leavesQty = Option.value_map ~default:0 order ~f:(fun o -> RespObj.int64_exn o "leavesQty" |> Int64.to_int_exn) in
+  let ticksize = String.Table.find_exn ticksizes symbol in
   debug "compute_orders %s %s %d %d %d" symbol (Side.show side) price leavesQty newQty;
   match leavesQty, newQty with
   | 0, 0 -> [], []
-  | 0, qty -> [mk_new_limit_order ~symbol ~side ~price ~qty], []
-  | qty, qty' -> [], [mk_amended_limit_order ~symbol ~price ~qty:qty' Option.(value_exn orderID)]
+  | 0, qty -> [mk_new_limit_order ~symbol ~side ~ticksize ~price ~qty], []
+  | qty, qty' -> [], [mk_amended_limit_order ~symbol ~ticksize ~price ~qty:qty' Option.(value_exn orderID)]
 
 let on_position_update (symbol: string) p oldp =
   let { max_pos_size } = String.Table.find_exn quoted_instruments symbol in
@@ -277,64 +179,13 @@ let on_position_update (symbol: string) p oldp =
         let askSubmit, askAmend = compute_orders symbol Ask askPrice askOrder newAskQty in
         let submit = bidSubmit @ askSubmit in
         let amend = bidAmend @ askAmend in
-        if submit <> [] then don't_wait_for @@ Deferred.ignore @@ Order.submit submit;
-        if amend <> [] then don't_wait_for @@ Deferred.ignore @@ Order.update amend
+        if submit <> [] then don't_wait_for @@ Deferred.ignore @@ Order.submit !order_cfg submit;
+        if amend <> [] then don't_wait_for @@ Deferred.ignore @@ Order.update !order_cfg amend
       end
     | Some (midPrice, spread), None ->
       info "on_position_update: %d %d" (midPrice / divisor) (spread / divisor)
     | None, _ ->
       info "on_position_update: waiting for %s orderBookL2" symbol
-
-let update_orders_price symbol side dprice =
-  let mk_order o =
-    let oid = RespObj.string_exn o "orderID" in
-    let old_price = satoshis_int_of_float_exn @@ RespObj.float_exn o "price" in
-    let new_price = old_price + dprice in
-    info "update order %s %s id=%s oldp=%d newp=%d"
-      symbol (Side.show side) oid old_price new_price;
-    mk_amended_limit_order ~symbol ~price:new_price oid
-  in
-  if dprice = 0 then None
-  else
-  let oid = String.Table.find (current_orders side) symbol in
-  let order = Option.bind oid (Uuid.Table.find orders) in
-  let order = Option.bind order (fun order ->
-      RespObj.(Option.bind
-                 (bool order "workingIndicator")
-                 (function true -> Some order | false -> None)
-              )
-    )
-  in
-  Option.map order ~f:mk_order
-
-let update_orders () =
-  let iter_f ~key:symbol ~data:{ update_period } =
-    let update_f =
-      let old_best_bid = ref @@ RemoteOB.ticker symbol Bid Vwap in
-      let old_best_ask = ref @@ RemoteOB.ticker symbol Ask Vwap in
-      fun () ->
-        let new_best_bid = RemoteOB.ticker symbol Bid Vwap in
-        let new_best_ask = RemoteOB.ticker symbol Ask Vwap in
-        let amended_bid =
-          Option.(map2 !old_best_bid new_best_bid (fun old_bb bb ->
-              update_orders_price symbol Bid (bb - old_bb)) |> join)
-        in
-        let amended_ask =
-          Option.(map2 !old_best_ask new_best_ask (fun old_ba ba ->
-              update_orders_price symbol Ask (ba - old_ba)) |> join)
-        in
-        old_best_bid := new_best_bid;
-        old_best_ask := new_best_ask;
-        let orders = List.filter_opt [amended_bid; amended_ask] in
-        match orders with
-        | [] -> Deferred.unit
-        | orders -> Order.update orders >>| function
-          | Ok _ -> ()
-          | Error err -> error "%s" @@ Error.to_string_hum err
-    in
-    Clock_ns.run_at_intervals' (Time_ns.Span.of_int_ms update_period) update_f
-  in
-  String.Table.iteri quoted_instruments ~f:iter_f
 
 let on_ticker_update { Protocols.OrderBook.symbol; side; best; vwap } =
   (* debug "<- tickup %s %s %d %d" symbol (Side.show side) (best / 1_000_000) (vwap / 1_000_000); *)
@@ -553,7 +404,7 @@ let market_make buf instruments =
       | _ -> error "Invalid table %s" table
   in
   (* Cancel all orders *)
-  Order.cancel_all () >>= function
+  Order.cancel_all !order_cfg >>= function
   | Error err ->
     let err_str = Error.to_string_hum err in
     error "%s" err_str;
@@ -562,7 +413,7 @@ let market_make buf instruments =
     info "all orders canceled";
     let topics = "instrument" :: "order" :: "position" :: List.map instruments ~f:(fun i -> "orderBookL2:" ^ i) in
     don't_wait_for @@ dead_man's_switch 60000 15;
-    update_orders ();
+    S.update_orders ();
     Clock_ns.after @@ Time_ns.Span.of_int_ms 50 >>= fun () ->
     Ws.with_connection
       ~testnet:!testnet
@@ -620,12 +471,14 @@ let rpc_client port =
 let main cfg port daemon pidfile logfile loglevel main dry_run' instruments () =
   don't_wait_for begin
     Lock_file.create_exn pidfile >>= fun () ->
-    dry_run := dry_run';
-    testnet := not main;
     let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> presult_exn in
     let { Cfg.key; secret; quote } = List.Assoc.find_exn cfg (if main then "BMEX" else "BMEXT") in
+    let secret_cstruct = Cstruct.of_string secret in
+    dry_run := dry_run';
+    testnet := not main;
     api_key := key;
-    api_secret := Cstruct.of_string secret;
+    api_secret := secret_cstruct;
+    order_cfg := Order.create_cfg ~dry_run:dry_run' ~testnet:(not main) ~key ~secret:secret_cstruct ();
     let instruments = if instruments = [] then quote else instruments in
     let buf = Bi_outbuf.create 4096 in
     if daemon then Daemon.daemonize ~cd:"." ();
