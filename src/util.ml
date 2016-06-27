@@ -19,4 +19,15 @@ let set_sign sign i = match sign, Int.sign i with
 | Pos, Neg -> Int.neg i
 | Neg, Pos -> Int.neg i
 
+let book_add_qty book price qty =
+  Int.Map.update book price ~f:(function
+    | None -> qty
+    | Some oldq -> oldq + qty)
 
+let book_modify_qty ?(allow_empty=false) book price qty =
+  Int.Map.change book price ~f:(function
+    | None -> if allow_empty then Some qty else invalid_arg "book_modify_qty"
+    | Some oldq ->
+      let newq = oldq + qty in
+      if newq > 0 then Some newq else None
+    )

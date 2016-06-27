@@ -83,14 +83,14 @@ let compute_vwaps sym side vwaps old_book new_book =
   let vlimit = String.Table.find subscriptions sym in
   let old_vwap = String.Table.find vwaps sym in
   let new_vp, total_v = vwap ?vlimit side new_book in
-  let new_vwap = new_vp / total_v in
+  let new_vwap = try new_vp / total_v with Division_by_zero -> 0 in
   String.Table.set vwaps sym (new_vwap, total_v);
   let best_elt_f = Int.Map.(match side with Side.Bid -> max_elt | Ask -> min_elt) in
   let old_best_elt = Option.map ~f:fst @@ best_elt_f old_book in
   let new_best_elt = Option.map ~f:fst @@ best_elt_f new_book in
   begin match old_best_elt, new_best_elt, old_vwap with
   | Some old_best, Some new_best, Some (old_vwap, _) when old_best <> new_best || old_vwap <> new_vwap ->
-    Log.debug log_bfx "-> tickup %s %s %d %d" sym (Side.show side) (new_best / 1_000_000) (new_vwap / 1_000_000);
+    if old_best <> new_best then Log.debug log_bfx "-> tickup %s %s %d %d" sym (Side.show side) (new_best / 1_000_000) (new_vwap / 1_000_000);
     Option.iter !tickups_w ~f:(fun p ->
         (try
           Pipe.write_without_pushback p @@
@@ -101,17 +101,6 @@ let compute_vwaps sym side vwaps old_book new_book =
   end
 
 let on_bfx_book_update sym { BFX.Ws.Book.Raw.id; price = new_price; amount = new_qty } =
-  let book_add_qty book price qty =
-    Int.Map.update book price ~f:(function None -> qty | Some oldq -> oldq + qty)
-  in
-  let book_modify_qty_exn book price qty =
-    Int.Map.update book price ~f:(function None -> invalid_arg "book_modify_qty" | Some oldq -> oldq + qty)
-  in
-  let book_modify_qty book price qty =
-    try book_modify_qty_exn book price qty with _ ->
-      Log.error log_bfx "book_modify_qty: inconsistent %s %d %d" sym price qty;
-      book
-  in
   let orders = String.Table.find_exn bfx_orders sym in
   let side, books, vwaps = match Float.sign_exn new_qty with
     | Zero -> invalid_arg "on_book_update"
@@ -135,10 +124,8 @@ let on_bfx_book_update sym { BFX.Ws.Book.Raw.id; price = new_price; amount = new
   | Insert, Some newp, Some newq, Some { price = oldp; qty = oldq } ->
     Int.Table.set orders id { price = newp; qty = newq };
     let intermediate_book = book_modify_qty old_book oldp (set_sign Neg oldq) in
-    book_modify_qty intermediate_book newp (set_sign Pos newq)
-  | _ ->
-    Log.error log_bfx "Our internal orderbook is inconsistent with a BFX update!";
-    old_book
+    book_modify_qty ~allow_empty:true intermediate_book newp (set_sign Pos newq)
+  | _ -> failwithf "inconsistent BFX update" ()
   in
   String.Table.set books sym new_book;
   compute_vwaps sym side vwaps old_book new_book
@@ -226,7 +213,7 @@ let subscribe sym xbt_v =
     ] ()
 
 let push_initial_tickers w side symbol =
-  let best = match side with
+  let best_f = match side with
   | Side.Bid -> Int.Map.max_elt
   | Ask -> Int.Map.min_elt
   in
@@ -234,7 +221,7 @@ let push_initial_tickers w side symbol =
     let open Option.Monad_infix in
     bfx_book side symbol >>= fun book ->
     bfx_vwaps side symbol >>= fun (vwap, _) ->
-    best book >>| fun best -> fst best, vwap
+    best_f book >>| fun best -> fst best, vwap
   in
   Option.iter infos ~f:(fun (best, vwap) ->
       Pipe.write_without_pushback w @@

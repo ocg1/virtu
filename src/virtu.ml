@@ -236,7 +236,8 @@ let on_position_update (symbol: string) p oldp =
     don't_wait_for @@ Deferred.ignore @@ Rpc.Connection.with_client ~host:"localhost" ~port:!hedger_port fw_p_to_hedger;
     match OB.mid_price symbol Best, RemoteOB.mid_price symbol Vwap with
     | Some (midPrice, spread), Some (rMidPrice, rSpread) when rSpread < spread ->
-      info "on_position_update: %d %d %d %d" midPrice spread rMidPrice rSpread;
+      info "on_position_update: %d %d %d %d"
+        (midPrice / 1_000_000) (spread / 1_000_000) (rMidPrice / 1_000_000) (rSpread / 1_000_000);
       let tickSize = String.Table.find_exn ticksizes symbol |> snd |> fun nbDigits -> Int.(pow 10 (8 + nbDigits)) in
       let rSpread = Int.max rSpread tickSize in
       let bidPrice = midPrice - rSpread in
@@ -258,9 +259,10 @@ let on_position_update (symbol: string) p oldp =
         if amend <> [] then don't_wait_for @@ Deferred.ignore @@ Order.update amend
       end
     | Some (midPrice, spread), Some (rMidPrice, rSpread) ->
-      info "on_position_update: %d %d %d %d" midPrice spread rMidPrice rSpread
+      info "on_position_update: %d %d %d %d"
+        (midPrice / 1_000_000) (spread / 1_000_000) (rMidPrice / 1_000_000) (rSpread / 1_000_000);
     | Some (midPrice, spread), None ->
-      info "on_position_update: %d %d" midPrice spread
+      info "on_position_update: %d %d" (midPrice / 1_000_000) (spread / 1_000_000)
     | None, _ ->
       info "on_position_update: waiting for %s orderBookL2" symbol
 
@@ -436,23 +438,13 @@ let on_position action data =
   | _ -> List.iter data ~f:on_update
 
 let on_orderbook action data =
+  (* debug "<- %s" (Yojson.Safe.to_string (`List data)); *)
   let action_str = show_update_action action in
   let of_json json =
     match OrderBook.L2.of_yojson json with
     | `Ok u -> u
     | `Error reason ->
       failwithf "%s: %s (%s)" reason Yojson.Safe.(to_string json) action_str ()
-  in
-  let book_add_qty book price qty =
-    Int.Map.update book price ~f:(function None -> qty | Some oldq -> oldq + qty)
-  in
-  let book_modify_qty_exn book price qty =
-    Int.Map.update book price ~f:(function None -> invalid_arg "book_modify_qty" | Some oldq -> oldq + qty)
-  in
-  let book_modify_qty book price qty =
-    try book_modify_qty_exn book price qty with _ ->
-      error "update_depth: inconsistent orderbooks!";
-      book
   in
   let update_depth action old_book { OrderBook.L2.symbol; id; side = side_str; price = new_price; size = new_qty } =
     let orders = String.Table.find_exn OB.orders symbol in
@@ -480,17 +472,15 @@ let on_orderbook action data =
       if oldp = newp then
         book_modify_qty old_book oldp (newq - oldq)
       else
-        let new_book = book_modify_qty old_book oldp (Int.neg oldq) in
-        book_modify_qty new_book newp newq
+        let intermediate_book = book_modify_qty old_book oldp (Int.neg oldq) in
+        book_modify_qty ~allow_empty:true intermediate_book newp newq
     | _ ->
-      error "update_depth: %s %d %d %d %d"
+      failwithf "update_depth: %s %d %d %d %d"
         action_str
         (Option.value ~default:Int.max_value old_price)
         (Option.value ~default:Int.max_value old_qty)
         (Option.value ~default:Int.max_value new_price)
-        (Option.value ~default:Int.max_value new_qty)
-      ;
-      old_book
+        (Option.value ~default:Int.max_value new_qty) ()
   in
   let data = List.map data ~f:of_json in
   let data = List.group data ~break:(fun u u' -> u.OrderBook.L2.symbol <> u'.symbol || u.side <> u'.side) in
@@ -510,11 +500,12 @@ let on_orderbook action data =
     (* compute vwap *)
     let max_pos_p, total_v = vwap ~vlimit:max_pos_size side new_book in
     String.Table.set vwaps ~key:h.symbol ~data:(OB.create_vwap ~max_pos_p ~total_v ());
-    info "BMEX %s %s best=%d vwap=%d totalv=%d"
-      h.symbol (Side.show side)
-      (Option.value_map (best_elt_f new_book) ~default:0 ~f:(fun (v, _) -> v / 1_000_000))
-      (max_pos_p / total_v / 1_000_000)
-      total_v;
+    if total_v > 0 then
+      info "BMEX %s %s %d %d %d"
+        h.symbol (Side.show side)
+        (Option.value_map (best_elt_f new_book) ~default:0 ~f:(fun (v, _) -> v / 1_000_000))
+        (max_pos_p / total_v / 1_000_000)
+        total_v;
 
     if action = Partial then begin
       debug "%s %s initialized" h.symbol (Side.show side);
