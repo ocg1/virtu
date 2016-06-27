@@ -26,20 +26,47 @@ let quoted_instruments : instrument_info String.Table.t = String.Table.create ()
 let instruments : RespObj.t String.Table.t = String.Table.create ()
 let orders : RespObj.t Uuid.Table.t = Uuid.Table.create ()
 let positions : RespObj.t String.Table.t = String.Table.create ()
-let ticksizes : (Float.t * Int.t) String.Table.t = String.Table.create ()
+
+let instruments_initialized = Ivar.create ()
+let feed_initialized =
+  let ivars = String.Table.fold quoted_instruments ~init:[]
+      ~f:(fun ~key ~data:{ bids_initialized; asks_initialized } a ->
+          bids_initialized :: asks_initialized :: a
+        )
+  in
+  Deferred.List.iter ~f:Ivar.read @@ instruments_initialized :: ivars
+
+let orders_initialized = Ivar.create ()
+let bid_set = Ivar.create ()
+let ask_set = Ivar.create ()
+
+type ticksize = {
+  multiplier: Float.t; (* i.e. 0.01 *)
+  mult_exponent: Int.t; (* 0.01 -> -2 *)
+  divisor: Int.t; (* i.e. 1_000_000 *)
+} [@@deriving create]
+
+let ticksizes : ticksize String.Table.t = String.Table.create ()
 
 let best_of_side = function
 | Side.Bid -> Int.Map.max_elt
 | Ask -> Int.Map.min_elt
 
-let digits_of_tickSize tickSize =
+let exponent_divisor_of_tickSize tickSize =
   let ts_str = Printf.sprintf "%.0e" tickSize in
   let e = String.index_exn ts_str 'e' in
   let exponent = String.(sub ts_str (e+2) (length ts_str - e - 2)) |> Int.of_string in
-  match String.get ts_str (e+1) with
+  let exponent = match String.get ts_str (e+1) with
   | '+' -> exponent
   | '-' -> Int.neg exponent
   | _ -> invalid_arg "digits_of_tickSize"
+  in
+  exponent, Int.(pow 10 (8 + exponent))
+
+let float_of_satoshis symbol price =
+  let { multiplier; mult_exponent; divisor } = String.Table.find_exn ticksizes symbol in
+  let res = Printf.sprintf "%.*f" (Int.neg mult_exponent) (Float.of_int (price / divisor) *. multiplier) in
+  Float.of_string res
 
 let current_bids : Uuid.t String.Table.t = String.Table.create ()
 let current_asks : Uuid.t String.Table.t = String.Table.create ()
@@ -194,17 +221,12 @@ let mk_new_market_order ~symbol ~qty : Yojson.Safe.json =
     "ordType", `String "Market";
   ]
 
-let price_of_satoshis symbol price =
-  let multiplier, nbDigits = String.Table.find_exn ticksizes symbol in
-  let price = price / Int.(pow 10 (8 + nbDigits)) in
-  Float.of_int price *. multiplier
-
 let mk_new_limit_order ~symbol ~side ~price ~qty : Yojson.Safe.json =
   `Assoc [
     "clOrdID", `String Uuid.(create () |> to_string);
     "symbol", `String symbol;
     "side", `String (match side with Side.Bid -> "Buy" | Ask -> "Sell");
-    "price", `Float (price_of_satoshis symbol price);
+    "price", `Float (float_of_satoshis symbol price);
     "orderQty", `Int qty;
     "execInst", `String "ParticipateDoNotInitiate"
   ]
@@ -213,7 +235,7 @@ let mk_amended_limit_order ?price ?qty ~symbol orderID : Yojson.Safe.json =
   `Assoc (List.filter_opt [
     Some ("orderID", `String orderID);
     Option.map qty ~f:(fun qty -> "leavesQty", `Int qty);
-    Option.map price ~f:(fun price -> "price", `Float (price_of_satoshis symbol price));
+    Option.map price ~f:(fun price -> "price", `Float (float_of_satoshis symbol price));
     ])
 
 let compute_orders symbol side price order newQty =
@@ -235,11 +257,11 @@ let on_position_update (symbol: string) p oldp =
     let fw_p_to_hedger c = Rpc.Rpc.dispatch Protocols.Position.t c (symbol, currentQty) in
     don't_wait_for @@ Deferred.ignore @@ Rpc.Connection.with_client ~host:"localhost" ~port:!hedger_port fw_p_to_hedger;
     match OB.mid_price symbol Best, RemoteOB.mid_price symbol Vwap with
-    | Some (midPrice, spread), Some (rMidPrice, rSpread) when rSpread < spread ->
+    | Some (midPrice, spread), Some (rMidPrice, rSpread) ->
       info "on_position_update: %d %d %d %d"
         (midPrice / 1_000_000) (spread / 1_000_000) (rMidPrice / 1_000_000) (rSpread / 1_000_000);
-      let tickSize = String.Table.find_exn ticksizes symbol |> snd |> fun nbDigits -> Int.(pow 10 (8 + nbDigits)) in
-      let rSpread = Int.max rSpread tickSize in
+      let { divisor } = String.Table.find_exn ticksizes symbol in
+      let rSpread = Int.(max divisor (min spread rSpread)) in
       let bidPrice = midPrice - rSpread in
       let askPrice = midPrice + rSpread in
       let bidOrder = Option.bind bidOrderID (Uuid.Table.find orders) in
@@ -258,9 +280,6 @@ let on_position_update (symbol: string) p oldp =
         if submit <> [] then don't_wait_for @@ Deferred.ignore @@ Order.submit submit;
         if amend <> [] then don't_wait_for @@ Deferred.ignore @@ Order.update amend
       end
-    | Some (midPrice, spread), Some (rMidPrice, rSpread) ->
-      info "on_position_update: %d %d %d %d"
-        (midPrice / 1_000_000) (spread / 1_000_000) (rMidPrice / 1_000_000) (rSpread / 1_000_000);
     | Some (midPrice, spread), None ->
       info "on_position_update: %d %d" (midPrice / 1_000_000) (spread / 1_000_000)
     | None, _ ->
@@ -322,25 +341,15 @@ let on_ticker_update { Protocols.OrderBook.symbol; side; best; vwap } =
   let rtickers = RemoteOB.tickers side in
   String.Table.set rtickers symbol (RemoteOB.create_ticker ~best ~vwap ())
 
-let instruments_initialized = Ivar.create ()
-let feed_initialized =
-  let ivars = String.Table.fold quoted_instruments ~init:[]
-      ~f:(fun ~key ~data:{ bids_initialized; asks_initialized } a ->
-          bids_initialized :: asks_initialized :: a
-        )
-  in
-  Deferred.List.iter ~f:Ivar.read @@ instruments_initialized :: ivars
-
-let orders_initialized = Ivar.create ()
-let bid_set = Ivar.create ()
-let ask_set = Ivar.create ()
-
 let on_instrument action data =
   let on_partial_insert i =
     let i = RespObj.of_json i in
     let sym = RespObj.string_exn i "symbol" in
     String.Table.set instruments sym i;
-    String.Table.set ticksizes ~key:sym ~data:(RespObj.float_exn i "tickSize" |> fun tickSize -> tickSize, digits_of_tickSize tickSize);
+    String.Table.set ticksizes ~key:sym
+      ~data:(RespObj.float_exn i "tickSize" |> fun multiplier ->
+             let mult_exponent, divisor = exponent_divisor_of_tickSize multiplier in
+             create_ticksize ~multiplier ~mult_exponent ~divisor ());
     String.Table.set OB.orders sym (Int.Table.create ());
     String.Table.set OB.bids sym (Int.Map.empty);
     String.Table.set OB.asks sym (Int.Map.empty)
