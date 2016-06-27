@@ -261,10 +261,9 @@ let on_position_update (symbol: string) p oldp =
     | Some (midPrice, spread), Some (rMidPrice, rSpread) ->
       info "on_position_update: %d %d %d %d"
         (midPrice / divisor) (spread / divisor) (rMidPrice / divisor) (rSpread / divisor);
-      let { divisor } = String.Table.find_exn ticksizes symbol in
-      let rSpread = Int.(max divisor (min spread rSpread)) in
-      let bidPrice = midPrice - rSpread in
-      let askPrice = midPrice + rSpread in
+      let mySpread = Int.(max divisor (min spread rSpread)) in
+      let bidPrice = midPrice - mySpread in
+      let askPrice = midPrice + mySpread in
       let bidOrder = Option.bind bidOrderID (Uuid.Table.find orders) in
       let askOrder = Option.bind askOrderID (Uuid.Table.find orders) in
       let currentBidQty = Option.value ~default:0 (RespObj.int64 p "openOrderBuyQty" |> Option.map ~f:Int64.to_int_exn) in
