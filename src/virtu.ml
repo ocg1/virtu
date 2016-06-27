@@ -25,8 +25,6 @@ let quoted_instruments : instrument_info String.Table.t = String.Table.create ()
 
 let instruments : RespObj.t String.Table.t = String.Table.create ()
 let orders : RespObj.t Uuid.Table.t = Uuid.Table.create ()
-let executions : RespObj.t Uuid.Table.t = Uuid.Table.create ()
-let margin = ref @@ RespObj.of_json (`Assoc [])
 let positions : RespObj.t String.Table.t = String.Table.create ()
 let ticksizes : (Float.t * Int.t) String.Table.t = String.Table.create ()
 
@@ -411,21 +409,6 @@ let on_order action data =
   | Insert | Update -> if Ivar.is_full orders_initialized then List.iter data ~f:(on_insert_update action)
   | Delete -> if Ivar.is_full orders_initialized then List.iter data ~f:on_delete
 
-let on_execution action data =
-  let on_exec e =
-    let e = RespObj.of_json e in
-    let eid = RespObj.string_exn e "execID" |> Uuid.of_string  in
-    Uuid.Table.set executions eid e
-  in
-  List.iter data ~f:on_exec
-
-let on_margin action data =
-  let on_margin m =
-    let m = RespObj.of_json m in
-    margin := m
-  in
-  List.iter data ~f:on_margin
-
 let on_position action data =
   let on_update p =
     let p = RespObj.of_json p in
@@ -513,12 +496,14 @@ let on_orderbook action data =
   let data = List.group data ~break:(fun u u' -> u.OrderBook.L2.symbol <> u'.symbol || u.side <> u'.side) in
   let iter_f = function
   | (h :: t) as us when String.Table.mem quoted_instruments h.OrderBook.L2.symbol ->
-    let side, best_elt, books, vwaps = match buy_sell_of_bmex h.OrderBook.L2.side with
+    let side, best_elt_f, books, vwaps = match buy_sell_of_bmex h.OrderBook.L2.side with
     | `Buy -> Side.Bid, Int.Map.max_elt, OB.bids, OB.bid_vwaps
     | `Sell -> Ask, Int.Map.min_elt, OB.asks, OB.ask_vwaps
     in
     let { max_pos_size } = String.Table.find_exn quoted_instruments h.symbol in
-    let old_book = String.Table.find_exn books h.symbol in
+    let old_book = if action = Partial then Int.Map.empty else
+      String.Table.find_exn books h.symbol
+    in
     let new_book = List.fold_left us ~init:old_book ~f:(update_depth action) in
     String.Table.set books h.symbol new_book;
 
@@ -527,7 +512,7 @@ let on_orderbook action data =
     String.Table.set vwaps ~key:h.symbol ~data:(OB.create_vwap ~max_pos_p ~total_v ());
     info "BMEX %s %s best=%d vwap=%d totalv=%d"
       h.symbol (Side.show side)
-      (Option.value_map (best_elt new_book) ~default:0 ~f:(fun (v, _) -> v / 1_000_000))
+      (Option.value_map (best_elt_f new_book) ~default:0 ~f:(fun (v, _) -> v / 1_000_000))
       (max_pos_p / total_v / 1_000_000)
       total_v;
 
@@ -564,8 +549,6 @@ let market_make buf instruments =
       | "orderBookL2" -> on_orderbook action data
       | "order" -> on_order action data
       | "position" -> on_position action data
-      | "execution" -> on_execution action data
-      | "margin" -> on_margin action data
       | _ -> error "Invalid table %s" table
   in
   (* Cancel all orders *)
@@ -576,18 +559,11 @@ let market_make buf instruments =
     failwith err_str
   | Ok _ ->
     info "all orders canceled";
-    let topics = "instrument" :: List.map instruments ~f:(fun i -> "orderBookL2:" ^ i) in
-    let to_ws, to_ws_w = Pipe.create () in
-    don't_wait_for begin feed_initialized >>= fun () ->
-      let args = `List (List.map ["order"; "execution"; "margin"; "position"] ~f:(fun s -> `String s)) in
-      Pipe.write to_ws_w @@ Ws.create_query ~op:"subscribe" ~args () >>| fun () ->
-      Pipe.close to_ws_w
-    end;
+    let topics = "instrument" :: "order" :: "position" :: List.map instruments ~f:(fun i -> "orderBookL2:" ^ i) in
     don't_wait_for @@ dead_man's_switch 60000 15;
     update_orders ();
     Clock_ns.after @@ Time_ns.Span.of_int_ms 50 >>= fun () ->
     Ws.with_connection
-      ~to_ws
       ~testnet:!testnet
       ~auth:(!api_key, !api_secret)
       ~topics
