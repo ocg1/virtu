@@ -74,8 +74,13 @@ module OB = struct
   let asks : (Int.t Int.Map.t) String.Table.t = String.Table.create ()
   let book_of_side = function Side.Bid -> bids | Ask -> asks
 
-  let best_price side symbol =
-    Option.Monad_infix.(String.Table.find (book_of_side side) symbol >>= best_of_side side)
+  let best_price ?remove_order side symbol =
+    let open Option.Monad_infix in
+    String.Table.find (book_of_side side) symbol >>= fun book ->
+    let book = Option.value_map remove_order ~default:book
+        ~f:(fun (price, qty) -> book_modify_qty book price @@ Int.neg qty)
+    in
+    best_of_side side book
 
   type vwap = {
     max_pos_p: int;
@@ -90,10 +95,10 @@ module OB = struct
     let vwaps = vwaps_of_side side in
     String.Table.find vwaps symbol
 
-  let mid_price symbol = function
+  let mid_price ?remove_bid ?remove_ask symbol = function
     | Best ->
-      let best_bid = best_price Side.Bid symbol in
-      let best_ask = best_price Ask symbol in
+      let best_bid = best_price ?remove_order:remove_bid Side.Bid symbol in
+      let best_ask = best_price ?remove_order:remove_ask Ask symbol in
       Option.map2 best_bid best_ask (fun (bb,_) (ba,_) ->
           let midPrice =  (bb + ba) / 2 in
           midPrice, ba - midPrice
@@ -120,7 +125,7 @@ module OB = struct
   | _ -> invalid_arg "xbt_value"
 end
 
-module S = Strategy.FollowBFX(struct
+module S = Strategy.Blanket(struct
     let log = Lazy.(force log)
     let order_cfg = lazy(!order_cfg)
     let orders = orders
@@ -128,6 +133,7 @@ module S = Strategy.FollowBFX(struct
     let quoted_instruments = quoted_instruments
     let ticksizes = ticksizes
     let remote_ticker = RemoteOB.ticker
+    let local_mid_price = OB.mid_price
   end)
 
 let dead_man's_switch timeout period =
@@ -159,11 +165,10 @@ let on_position_update (symbol: string) p oldp =
     let fw_p_to_hedger c = Rpc.Rpc.dispatch Protocols.Position.t c (symbol, currentQty) in
     don't_wait_for @@ Deferred.ignore @@ Rpc.Connection.with_client ~host:"localhost" ~port:!hedger_port fw_p_to_hedger;
     let { divisor } = String.Table.find_exn ticksizes symbol in
-    match OB.mid_price symbol Best, RemoteOB.mid_price symbol Vwap with
-    | Some (midPrice, spread), Some (rMidPrice, rSpread) ->
-      info "on_position_update: %d %d %d %d"
-        (midPrice / divisor) (spread / divisor) (rMidPrice / divisor) (rSpread / divisor);
-      let mySpread = Int.(max divisor (min spread rSpread)) in
+    match OB.mid_price symbol Best with
+    | Some (midPrice, spread) ->
+      info "on_position_update: %d %d" (midPrice / divisor) (spread / divisor);
+      let mySpread = Int.max divisor spread in
       let bidPrice = midPrice - mySpread in
       let askPrice = midPrice + mySpread in
       let bidOrder = Option.bind bidOrderID (Uuid.Table.find orders) in
@@ -182,9 +187,7 @@ let on_position_update (symbol: string) p oldp =
         if submit <> [] then don't_wait_for @@ Deferred.ignore @@ Order.submit !order_cfg submit;
         if amend <> [] then don't_wait_for @@ Deferred.ignore @@ Order.update !order_cfg amend
       end
-    | Some (midPrice, spread), None ->
-      info "on_position_update: %d %d" (midPrice / divisor) (spread / divisor)
-    | None, _ ->
+    | None ->
       info "on_position_update: waiting for %s orderBookL2" symbol
 
 let on_ticker_update { Protocols.OrderBook.symbol; side; best; vwap } =
@@ -383,7 +386,7 @@ let on_orderbook action data =
     List.iter data ~f:iter_f
   end
 
-let market_make buf instruments =
+let market_make buf fixed_spread instruments =
   let on_ws_msg msg_str =
     let msg_json = Yojson.Safe.from_string ~buf msg_str in
     match Ws.update_of_yojson msg_json with
@@ -413,7 +416,7 @@ let market_make buf instruments =
     info "all orders canceled";
     let topics = "instrument" :: "order" :: "position" :: List.map instruments ~f:(fun i -> "orderBookL2:" ^ i) in
     don't_wait_for @@ dead_man's_switch 60000 15;
-    S.update_orders ();
+    S.update_orders @@ Option.value_map fixed_spread ~default:`Blanket ~f:(fun i -> `Fixed i);
     Clock_ns.after @@ Time_ns.Span.of_int_ms 50 >>= fun () ->
     Ws.with_connection
       ~testnet:!testnet
@@ -468,7 +471,7 @@ let rpc_client port =
         Clock_ns.after @@ Time_ns.Span.of_int_sec 5 >>= loop
   in loop ()
 
-let main cfg port daemon pidfile logfile loglevel main dry_run' instruments () =
+let main cfg port daemon pidfile logfile loglevel main dry_run' fixed_spread instruments () =
   don't_wait_for begin
     Lock_file.create_exn pidfile >>= fun () ->
     let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> presult_exn in
@@ -491,8 +494,8 @@ let main cfg port daemon pidfile logfile loglevel main dry_run' instruments () =
       );
     info "Virtu starting";
     Deferred.(all_unit [
-        ignore @@ rpc_client port;
-        market_make buf @@ String.Table.keys quoted_instruments;
+        (* ignore @@ rpc_client port; *)
+        market_make buf fixed_spread @@ String.Table.keys quoted_instruments;
       ]);
   end;
   never_returns @@ Scheduler.go ()
@@ -510,6 +513,7 @@ let command =
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
     +> flag "-main" no_arg ~doc:" Use mainnet"
     +> flag "-dry" no_arg ~doc:" Simulation mode"
+    +> flag "-fixed" (optional int) ~doc:"tick Post bid/ask with a fixed spread"
     +> anon (sequence (t3 ("instrument" %: string) ("quote" %: int) ("period" %: int)))
   in
   Command.basic ~summary:"Market maker bot" spec main

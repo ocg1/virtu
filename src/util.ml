@@ -78,6 +78,12 @@ type instrument_info = {
   update_period: int; (* in ms *)
 } [@@deriving create]
 
+type ticksize = {
+  multiplier: Float.t; (* i.e. 0.01 *)
+  mult_exponent: Int.t; (* 0.01 -> -2 *)
+  divisor: Int.t; (* i.e. 1_000_000 *)
+} [@@deriving create]
+
 let set_sign sign i = match sign, Int.sign i with
 | Sign.Zero, _ -> invalid_arg "set_sign"
 | _, Zero -> 0
@@ -113,12 +119,6 @@ let exponent_divisor_of_tickSize tickSize =
   | _ -> invalid_arg "digits_of_tickSize"
   in
   exponent, Int.(pow 10 (8 + exponent))
-
-type ticksize = {
-  multiplier: Float.t; (* i.e. 0.01 *)
-  mult_exponent: Int.t; (* 0.01 -> -2 *)
-  divisor: Int.t; (* i.e. 1_000_000 *)
-} [@@deriving create]
 
 let float_of_satoshis symbol { multiplier; mult_exponent; divisor } price =
   let res = Printf.sprintf "%.*f" (Int.neg mult_exponent) (Float.of_int (price / divisor) *. multiplier) in
