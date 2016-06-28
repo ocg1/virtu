@@ -156,19 +156,22 @@ let compute_orders symbol side price order newQty =
   | 0, qty -> [mk_new_limit_order ~symbol ~side ~ticksize ~price ~qty], []
   | qty, qty' -> [], [mk_amended_limit_order ~symbol ~ticksize ~price ~qty:qty' Option.(value_exn orderID)]
 
-let on_position_update (symbol: string) p oldp =
+let on_position_update symbol oldp p =
   let { max_pos_size } = String.Table.find_exn quoted_instruments symbol in
+  let oldQty = Option.value_map oldp ~default:0
+      ~f:(fun oldp -> RespObj.int64_exn oldp "currentQty" |> Int64.to_int_exn)
+  in
   let currentQty = RespObj.int64_exn p "currentQty" |> Int64.to_int_exn in
-  let oldQty = Option.value_map oldp ~default:0 ~f:(fun oldp -> RespObj.int64_exn p "currentQty" |> Int64.to_int_exn) in
   let bidOrderID = String.Table.find current_bids symbol in
   let askOrderID = String.Table.find current_asks symbol in
+  debug "<- update position %s %d -> %d" symbol oldQty currentQty;
   if currentQty <> oldQty || Option.(is_none bidOrderID && is_none askOrderID) then
     let fw_p_to_hedger c = Rpc.Rpc.dispatch Protocols.Position.t c (symbol, currentQty) in
     don't_wait_for @@ Deferred.ignore @@ Rpc.Connection.with_client ~host:"localhost" ~port:!hedger_port fw_p_to_hedger;
     let { divisor } = String.Table.find_exn ticksizes symbol in
     match OB.mid_price symbol Best with
     | Some (midPrice, spread) ->
-      info "on_position_update: %d %d" (midPrice / divisor) (spread / divisor);
+      info "local mid price %d, spread %d" (midPrice / divisor) (spread / divisor);
       let mySpread = Int.max divisor spread in
       let bidPrice = midPrice - mySpread in
       let askPrice = midPrice + mySpread in
@@ -179,8 +182,10 @@ let on_position_update (symbol: string) p oldp =
       let newBidQty = Int.max (max_pos_size - currentQty) 0 in
       let newAskQty = Int.max (max_pos_size + currentQty) 0 in
       if currentBidQty <> newBidQty || currentAskQty <> newAskQty then begin
-        info "Updating orders to match current position: bid_qty=%d ask_qty=%d" newBidQty newAskQty;
-        info "Found bid: %b, ask: %b" (Option.is_some bidOrderID) (Option.is_some askOrderID);
+        info "target position: bid %d -> %d, ask %d -> %d" currentBidQty newBidQty currentAskQty newAskQty;
+        info "current orders: (%s) (%s)"
+          (Option.value_map ~default:"" ~f:Uuid.to_string bidOrderID)
+          (Option.value_map ~default:"" ~f:Uuid.to_string askOrderID);
         let bidSubmit, bidAmend = compute_orders symbol Bid bidPrice bidOrder newBidQty in
         let askSubmit, askAmend = compute_orders symbol Ask askPrice askOrder newAskQty in
         let submit = bidSubmit @ askSubmit in
@@ -295,9 +300,7 @@ let on_position action data =
           ~default:p ~f:(fun oldp -> RespObj.merge oldp p)
       in
       String.Table.set positions sym p;
-      let currentQty = RespObj.int64_exn p "currentQty" in
-      debug "<- update position %s %Ld" sym currentQty;
-      on_position_update sym p oldp
+      on_position_update sym oldp p
   in
   let on_delete p =
     let p = RespObj.of_json p in

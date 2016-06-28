@@ -44,7 +44,7 @@ module Common (C : Cfg) = struct
       let oid = RespObj.string_exn o "orderID" in
       let old_price = satoshis_int_of_float_exn @@ RespObj.float_exn o "price" in
       let new_price = match dprice with `Abs p -> p | `Diff dp -> old_price + dp in
-      Log.info log "update order %s %s id=%s oldp=%d newp=%d"
+      Log.info log "update order price %s %s %s %d -> %d"
         symbol (Side.show side) oid old_price new_price;
       let ticksize = String.Table.find_exn ticksizes symbol in
       mk_amended_limit_order ~symbol ~ticksize ~price:new_price oid
