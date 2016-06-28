@@ -19,6 +19,7 @@ module type Cfg = sig
     ?remove_bid:(int * int) ->
     ?remove_ask:(int * int) ->
     string -> ticker_kind -> (int * int) option
+  val remote_mid_price : string -> ticker_kind -> (int * int) option
 end
 
 module Common (C : Cfg) = struct
@@ -61,23 +62,36 @@ module Blanket (C : Cfg) = struct
     let iter_f ~key:symbol ~data:{ update_period } =
       let update_f =
         let oldMidPrice = ref @@ local_mid_price symbol Best in
+        let oldRemoteMidPrice = ref @@ remote_mid_price symbol Best in
         fun () ->
           let oldMidPrice' = !oldMidPrice in
+          let oldRemoteMidPrice' = !oldRemoteMidPrice in
+          let remoteMidPrice = remote_mid_price symbol Best in
           let currentBidOrder = current_working_order symbol Bid in
           let currentAskOrder = current_working_order symbol Ask in
           let currentBidPQty = Option.map currentBidOrder ~f:price_qty_of_order in
           let currentAskPQty = Option.map currentAskOrder ~f:price_qty_of_order in
           let midPrice = local_mid_price ?remove_bid:currentBidPQty ?remove_ask:currentAskPQty symbol Best in
           oldMidPrice := midPrice;
-          begin match oldMidPrice', midPrice with
-          | Some (oldm, olds), Some (newm, news) when oldm <> newm ->
+          oldRemoteMidPrice := remoteMidPrice;
+          begin match oldMidPrice', midPrice, oldRemoteMidPrice', remoteMidPrice with
+          | Some (oldm, olds), Some (newm, news), Some (oldremm, oldrems), Some (remm, rems) when oldm <> newm || oldremm <> remm ->
             let { divisor } = String.Table.find_exn ticksizes symbol in
-            let offset = match param with
-            | `Blanket -> news + divisor
-            | `Fixed i -> i * divisor
+            let center, spread = match param with
+            | `Blanket -> newm, news + divisor
+            | `Fixed i -> newm, i * divisor
+            | `FixedRemote i ->
+              let center =
+                let low_boundary = newm - news + i * divisor in
+                let high_boundary = newm + news - i * divisor in
+                if remm < low_boundary then low_boundary
+                else if remm > high_boundary then high_boundary
+                else remm
+              in
+              center, i * divisor
             in
-            let amended_bid = update_orders_price symbol Bid (`Abs (newm - offset)) in
-            let amended_ask = update_orders_price symbol Ask (`Abs (newm + offset)) in
+            let amended_bid = update_orders_price symbol Bid (`Abs (center - spread)) in
+            let amended_ask = update_orders_price symbol Ask (`Abs (center + spread)) in
             let orders = List.filter_opt [amended_bid; amended_ask] in
             begin match orders with
             | [] -> Deferred.unit

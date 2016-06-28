@@ -134,6 +134,7 @@ module S = Strategy.Blanket(struct
     let ticksizes = ticksizes
     let remote_ticker = RemoteOB.ticker
     let local_mid_price = OB.mid_price
+    let remote_mid_price = RemoteOB.mid_price
   end)
 
 let dead_man's_switch timeout period =
@@ -161,7 +162,7 @@ let on_position_update (symbol: string) p oldp =
   let oldQty = Option.value_map oldp ~default:0 ~f:(fun oldp -> RespObj.int64_exn p "currentQty" |> Int64.to_int_exn) in
   let bidOrderID = String.Table.find current_bids symbol in
   let askOrderID = String.Table.find current_asks symbol in
-  if currentQty <> oldQty || Option.is_none bidOrderID || Option.is_none askOrderID then
+  if currentQty <> oldQty || Option.(is_none bidOrderID && is_none askOrderID) then
     let fw_p_to_hedger c = Rpc.Rpc.dispatch Protocols.Position.t c (symbol, currentQty) in
     don't_wait_for @@ Deferred.ignore @@ Rpc.Connection.with_client ~host:"localhost" ~port:!hedger_port fw_p_to_hedger;
     let { divisor } = String.Table.find_exn ticksizes symbol in
@@ -184,8 +185,18 @@ let on_position_update (symbol: string) p oldp =
         let askSubmit, askAmend = compute_orders symbol Ask askPrice askOrder newAskQty in
         let submit = bidSubmit @ askSubmit in
         let amend = bidAmend @ askAmend in
-        if submit <> [] then don't_wait_for @@ Deferred.ignore @@ Order.submit !order_cfg submit;
-        if amend <> [] then don't_wait_for @@ Deferred.ignore @@ Order.update !order_cfg amend
+        if submit <> [] then don't_wait_for begin
+          Order.submit !order_cfg submit >>| function
+          | Ok _ -> ()
+          | Error err ->
+            error "%s" @@ Error.to_string_hum err
+        end;
+        if amend <> [] then don't_wait_for begin
+            Order.update !order_cfg amend >>| function
+          | Ok _ -> ()
+          | Error err ->
+            error "%s" @@ Error.to_string_hum err
+        end
       end
     | None ->
       info "on_position_update: waiting for %s orderBookL2" symbol
@@ -386,7 +397,7 @@ let on_orderbook action data =
     List.iter data ~f:iter_f
   end
 
-let market_make buf fixed_spread instruments =
+let market_make buf strategy instruments =
   let on_ws_msg msg_str =
     let msg_json = Yojson.Safe.from_string ~buf msg_str in
     match Ws.update_of_yojson msg_json with
@@ -416,7 +427,7 @@ let market_make buf fixed_spread instruments =
     info "all orders canceled";
     let topics = "instrument" :: "order" :: "position" :: List.map instruments ~f:(fun i -> "orderBookL2:" ^ i) in
     don't_wait_for @@ dead_man's_switch 60000 15;
-    S.update_orders @@ Option.value_map fixed_spread ~default:`Blanket ~f:(fun i -> `Fixed i);
+    S.update_orders strategy;
     Clock_ns.after @@ Time_ns.Span.of_int_ms 50 >>= fun () ->
     Ws.with_connection
       ~testnet:!testnet
@@ -471,7 +482,7 @@ let rpc_client port =
         Clock_ns.after @@ Time_ns.Span.of_int_sec 5 >>= loop
   in loop ()
 
-let main cfg port daemon pidfile logfile loglevel main dry_run' fixed_spread instruments () =
+let main cfg port daemon pidfile logfile loglevel main dry_run' fixed remfixed instruments () =
   don't_wait_for begin
     Lock_file.create_exn pidfile >>= fun () ->
     let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> presult_exn in
@@ -493,9 +504,14 @@ let main cfg port daemon pidfile logfile loglevel main dry_run' fixed_spread ins
           ~data:Ivar.(create_instrument_info (create ()) (create ()) v p ())
       );
     info "Virtu starting";
+    let strategy = match fixed, remfixed with
+    | None, None -> `Blanket
+    | Some fixed, _ -> `Fixed fixed
+    | _, Some remfixed -> `FixedRemote remfixed
+    in
     Deferred.(all_unit [
-        (* ignore @@ rpc_client port; *)
-        market_make buf fixed_spread @@ String.Table.keys quoted_instruments;
+        ignore @@ rpc_client port;
+        market_make buf strategy @@ String.Table.keys quoted_instruments;
       ]);
   end;
   never_returns @@ Scheduler.go ()
@@ -514,6 +530,7 @@ let command =
     +> flag "-main" no_arg ~doc:" Use mainnet"
     +> flag "-dry" no_arg ~doc:" Simulation mode"
     +> flag "-fixed" (optional int) ~doc:"tick Post bid/ask with a fixed spread"
+    +> flag "-fixed-remote" (optional int) ~doc:"tick Post bid/ask with a fixed spread"
     +> anon (sequence (t3 ("instrument" %: string) ("quote" %: int) ("period" %: int)))
   in
   Command.basic ~summary:"Market maker bot" spec main
