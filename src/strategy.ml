@@ -34,8 +34,10 @@ module Common (C : Cfg) = struct
     if leavesQty > 0L && working then Some o else None
 
   let price_qty_of_order o =
-    satoshis_int_of_float_exn @@ RespObj.float_exn o "price",
-    RespObj.int64_exn o "leavesQty" |> Int64.to_int_exn
+    let open Option.Monad_infix in
+    RespObj.float o "price" >>= fun price ->
+    RespObj.int64 o "leavesQty" >>| fun leavesQty ->
+    satoshis_int_of_float_exn price, Int64.to_int_exn leavesQty
 
   let update_orders_price symbol side dprice =
     let mk_order o =
@@ -68,8 +70,8 @@ module Blanket (C : Cfg) = struct
           let remoteMidPrice = remote_mid_price symbol Best in
           let currentBidOrder = current_working_order symbol Bid in
           let currentAskOrder = current_working_order symbol Ask in
-          let currentBidPQty = Option.map currentBidOrder ~f:price_qty_of_order in
-          let currentAskPQty = Option.map currentAskOrder ~f:price_qty_of_order in
+          let currentBidPQty = Option.bind currentBidOrder price_qty_of_order in
+          let currentAskPQty = Option.bind currentAskOrder price_qty_of_order in
           let midPrice = local_mid_price ?remove_bid:currentBidPQty ?remove_ask:currentAskPQty symbol Best in
           oldMidPrice := midPrice;
           oldRemoteMidPrice := remoteMidPrice;
