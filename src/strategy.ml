@@ -42,13 +42,14 @@ module Common (C : Cfg) = struct
       let oid = RespObj.string_exn o "orderID" in
       let old_price = satoshis_int_of_float_exn @@ RespObj.float_exn o "price" in
       let new_price = match dprice with `Abs p -> p | `Diff dp -> old_price + dp in
-      Log.info log "update order price %s %s %s %d -> %d"
-        symbol (Side.show side) oid old_price new_price;
-      let ticksize = String.Table.find_exn ticksizes symbol in
-      mk_amended_limit_order ~symbol ~ticksize ~price:new_price oid
+      if old_price = new_price then None else begin
+        Log.info log "update order price %s %s %s %d -> %d"
+          symbol (Side.show side) oid old_price new_price;
+        let ticksize = String.Table.find_exn ticksizes symbol in
+        Option.some @@ mk_amended_limit_order ~symbol ~ticksize ~price:new_price oid
+      end
     in
-    let order = current_working_order symbol side in
-    Option.map order ~f:mk_order
+    Option.Monad_infix.(current_working_order symbol side >>= mk_order)
 end
 
 module Blanket (C : Cfg) = struct
@@ -88,9 +89,11 @@ module Blanket (C : Cfg) = struct
               in
               center, i * divisor
             in
-            let amended_bid = update_orders_price symbol Bid (`Abs (center - spread)) in
-            let amended_ask = update_orders_price symbol Ask (`Abs (center + spread)) in
-            let orders = List.filter_opt [amended_bid; amended_ask] in
+            let orders = List.filter_opt [
+                update_orders_price symbol Bid (`Abs (center - spread));
+                update_orders_price symbol Ask (`Abs (center + spread))
+              ]
+            in
             begin match orders with
             | [] -> Deferred.unit
             | orders -> Order.update Lazy.(force order_cfg) orders >>| function
