@@ -169,14 +169,10 @@ let on_position_update symbol oldp p =
     let fw_p_to_hedger c = Rpc.Rpc.dispatch Protocols.Position.t c (symbol, currentQty) in
     don't_wait_for @@ Deferred.ignore @@ Rpc.Connection.with_client ~host:"localhost" ~port:!hedger_port fw_p_to_hedger;
     let { divisor } = String.Table.find_exn ticksizes symbol in
-    match OB.mid_price symbol Best with
-    | Some (midPrice, spread) ->
-      info "local mid price %d, spread %d" (midPrice / divisor) (spread / divisor);
-      let mySpread = Int.max divisor spread in
-      let bidPrice = midPrice - mySpread in
-      let askPrice = midPrice + mySpread in
-      let bidOrder = Option.bind bidOrderID (Uuid.Table.find orders) in
-      let askOrder = Option.bind askOrderID (Uuid.Table.find orders) in
+    let bestBid = OB.best_price Bid symbol in
+    let bestAsk = OB.best_price Ask symbol in
+    match bestBid, bestAsk with
+    | Some (bestBid, _), Some (bestAsk, _) ->
       let currentBidQty = Option.value ~default:0 (RespObj.int64 p "openOrderBuyQty" |> Option.map ~f:Int64.to_int_exn) in
       let currentAskQty = Option.value ~default:0 (RespObj.int64 p "openOrderSellQty" |> Option.map ~f:Int64.to_int_exn) in
       let newBidQty = Int.max (max_pos_size - currentQty) 0 in
@@ -186,8 +182,10 @@ let on_position_update symbol oldp p =
         info "current orders: (%s) (%s)"
           (Option.value_map ~default:"" ~f:Uuid.to_string bidOrderID)
           (Option.value_map ~default:"" ~f:Uuid.to_string askOrderID);
-        let bidSubmit, bidAmend = compute_orders symbol Bid bidPrice bidOrder newBidQty in
-        let askSubmit, askAmend = compute_orders symbol Ask askPrice askOrder newAskQty in
+        let bidOrder = Option.bind bidOrderID (Uuid.Table.find orders) in
+        let askOrder = Option.bind askOrderID (Uuid.Table.find orders) in
+        let bidSubmit, bidAmend = compute_orders symbol Bid bestBid bidOrder newBidQty in
+        let askSubmit, askAmend = compute_orders symbol Ask bestAsk askOrder newAskQty in
         let submit = bidSubmit @ askSubmit in
         let amend = bidAmend @ askAmend in
         if submit <> [] then don't_wait_for begin
@@ -203,8 +201,7 @@ let on_position_update symbol oldp p =
             error "%s" @@ Error.to_string_hum err
         end
       end
-    | None ->
-      info "on_position_update: waiting for %s orderBookL2" symbol
+    | _ -> info "on_position_update: waiting for %s orderBookL2" symbol
 
 let on_ticker_update { Protocols.OrderBook.symbol; side; best; vwap } =
   (* debug "<- tickup %s %s %d %d" symbol (Side.show side) (best / 1_000_000) (vwap / 1_000_000); *)
