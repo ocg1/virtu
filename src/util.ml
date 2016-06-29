@@ -69,7 +69,7 @@ module Order = struct
       )
 end
 
-type ticker_kind = Best | Vwap
+type best_price_kind = Best | Vwap
 
 type instrument_info = {
   bids_initialized: unit Ivar.t;

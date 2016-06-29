@@ -46,20 +46,20 @@ let current_orders = function
   | Ask -> current_asks
 
 module RemoteOB = struct
-  type ticker = { best: int; vwap: int } [@@deriving create]
+  type best_price = { best: int; vwap: int } [@@deriving create]
 
-  let bids : ticker String.Table.t = String.Table.create ()
-  let asks : ticker String.Table.t = String.Table.create ()
+  let bids : best_price String.Table.t = String.Table.create ()
+  let asks : best_price String.Table.t = String.Table.create ()
 
-  let tickers = function Side.Bid -> bids | Ask -> asks
+  let book_of_side = function Side.Bid -> bids | Ask -> asks
 
-  let ticker symbol side kind =
-    Option.map (String.Table.find (tickers side) symbol)
-      ~f:(fun { best; vwap } ->
-          match kind with Best -> best | Vwap -> vwap)
+  let best_price side kind symbol =
+    let open Option.Monad_infix in
+    String.Table.find (book_of_side side) symbol >>| fun { best; vwap } ->
+    match kind with Best -> best | Vwap -> vwap
 
   let mid_price symbol kind =
-    Option.map2 (ticker symbol Bid kind) (ticker symbol Ask kind)
+    Option.map2 (best_price Bid kind symbol) (best_price Ask kind symbol)
       ~f:(fun bb ba ->
           let midPrice = (bb + ba) / 2 in
           midPrice, ba - midPrice
@@ -132,8 +132,9 @@ module S = Strategy.Blanket(struct
     let current_orders = current_orders
     let quoted_instruments = quoted_instruments
     let ticksizes = ticksizes
-    let remote_ticker = RemoteOB.ticker
+    let local_best_price = OB.best_price
     let local_mid_price = OB.mid_price
+    let remote_best_price = RemoteOB.best_price
     let remote_mid_price = RemoteOB.mid_price
   end)
 
@@ -168,7 +169,6 @@ let on_position_update symbol oldp p =
   if currentQty <> oldQty || Option.(is_none bidOrderID && is_none askOrderID) then
     let fw_p_to_hedger c = Rpc.Rpc.dispatch Protocols.Position.t c (symbol, currentQty) in
     don't_wait_for @@ Deferred.ignore @@ Rpc.Connection.with_client ~host:"localhost" ~port:!hedger_port fw_p_to_hedger;
-    let { divisor } = String.Table.find_exn ticksizes symbol in
     let bestBid = OB.best_price Bid symbol in
     let bestAsk = OB.best_price Ask symbol in
     match bestBid, bestAsk with
@@ -205,8 +205,8 @@ let on_position_update symbol oldp p =
 
 let on_ticker_update { Protocols.OrderBook.symbol; side; best; vwap } =
   (* debug "<- tickup %s %s %d %d" symbol (Side.show side) (best / 1_000_000) (vwap / 1_000_000); *)
-  let rtickers = RemoteOB.tickers side in
-  String.Table.set rtickers symbol (RemoteOB.create_ticker ~best ~vwap ())
+  let rtickers = RemoteOB.book_of_side side in
+  String.Table.set rtickers symbol (RemoteOB.create_best_price ~best ~vwap ())
 
 let on_instrument action data =
   let on_partial_insert i =

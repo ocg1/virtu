@@ -14,12 +14,15 @@ module type Cfg = sig
   val quoted_instruments : instrument_info String.Table.t
 
   val ticksizes : ticksize String.Table.t
-  val remote_ticker : string -> Side.t -> ticker_kind -> Int.t option
+  val local_best_price :
+    ?remove_order:(int * int) ->
+    Side.t -> string -> (int * int) option
   val local_mid_price :
     ?remove_bid:(int * int) ->
     ?remove_ask:(int * int) ->
-    string -> ticker_kind -> (int * int) option
-  val remote_mid_price : string -> ticker_kind -> (int * int) option
+    string -> best_price_kind -> (int * int) option
+  val remote_best_price : Side.t -> best_price_kind -> string -> Int.t option
+  val remote_mid_price : string -> best_price_kind -> (int * int) option
 end
 
 module Common (C : Cfg) = struct
@@ -118,11 +121,11 @@ module FollowBFX (C : Cfg) = struct
   let update_orders () =
     let iter_f ~key:symbol ~data:{ update_period } =
       let update_f =
-        let old_best_bid = ref @@ remote_ticker symbol Bid Vwap in
-        let old_best_ask = ref @@ remote_ticker symbol Ask Vwap in
+        let old_best_bid = ref @@ remote_best_price Bid Vwap symbol in
+        let old_best_ask = ref @@ remote_best_price Ask Vwap symbol in
         fun () ->
-          let new_best_bid = remote_ticker symbol Bid Vwap in
-          let new_best_ask = remote_ticker symbol Ask Vwap in
+          let new_best_bid = remote_best_price Bid Vwap symbol in
+          let new_best_ask = remote_best_price Ask Vwap symbol in
           let amended_bid =
             Option.(map2 !old_best_bid new_best_bid (fun old_bb bb ->
                 update_orders_price symbol Bid (`Diff (bb - old_bb))) |> join)
