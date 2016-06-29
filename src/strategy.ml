@@ -26,14 +26,12 @@ module Common (C : Cfg) = struct
   open C
 
   let current_working_order symbol side =
-    let oid = String.Table.find (current_orders side) symbol in
-    let order = Option.bind oid (Uuid.Table.find orders) in
-    Option.bind order (fun order ->
-        RespObj.(Option.bind
-                   (bool order "workingIndicator")
-                   (function true -> Some order | false -> None)
-                )
-      )
+    let open Option.Monad_infix in
+    String.Table.find (current_orders side) symbol >>= fun oid ->
+    Uuid.Table.find orders oid >>= fun o ->
+    RespObj.int64 o "leavesQty" >>= fun leavesQty ->
+    RespObj.bool o "workingIndicator" >>= fun working ->
+    if leavesQty > 0L && working then Some o else None
 
   let price_qty_of_order o =
     satoshis_int_of_float_exn @@ RespObj.float_exn o "price",
