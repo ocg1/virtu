@@ -403,7 +403,7 @@ let market_make buf strategy instruments =
     don't_wait_for @@ dead_man's_switch 60000 15;
     S.update_orders strategy;
     Clock_ns.after @@ Time_ns.Span.of_int_ms 50 >>= fun () ->
-    let ws = Ws.with_connection ~log:log_ws ~testnet:!testnet ~auth:(!api_key, !api_secret) ~topics () in
+    let ws = Ws.open_connection ~log:log_ws ~testnet:!testnet ~auth:(!api_key, !api_secret) ~topics () in
     Monitor.handle_errors
       (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
       (fun exn -> error "%s" @@ Exn.to_string exn)
@@ -462,7 +462,18 @@ let tickers_of_instrument = function
       satoshis_int_of_float_exn @@ Float.of_string bid,
       satoshis_int_of_float_exn @@ Float.of_string ask
     )
-| _ -> invalid_arg "ticker_of_instrument"
+| "ETHXBT" ->
+  let open Bs_api.PLNX in
+  Pipe.filter_map (Ws.open_connection ~topics:["ticker"] ()) ~f:(fun msg ->
+      let event = Wamp.event_of_msg msg in
+      let { Ws.symbol; bid; ask } = Ws.ticker_of_json @@ `List event.args in
+      if symbol <> to_remote_sym "ETHXBT" then None
+      else begin
+        debug "PLNX %s %f %f" symbol bid ask;
+        Some (satoshis_int_of_float_exn bid, satoshis_int_of_float_exn ask)
+      end
+    )
+| _ -> invalid_arg "tickers_of_instrument"
 
 let main cfg port daemon pidfile logfile loglevel wsllevel main dry_run' fixed remfixed instruments () =
   don't_wait_for begin

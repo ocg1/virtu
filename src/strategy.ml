@@ -79,28 +79,35 @@ module Blanket (C : Cfg) = struct
         let oldLocAsk = local_best_price Ask symbol |> Option.map ~f:fst |> Ref.create in
         let oldRemBid = ref 0 in
         let oldRemAsk = ref 0 in
+        let latest_update = ref Time_ns.epoch in
         fun (newRemBid, newRemAsk) ->
-          let currentBidOrder = current_working_order symbol Bid in
-          let currentAskOrder = current_working_order symbol Ask in
-          let currentBidPQty = Option.bind currentBidOrder price_qty_of_order in
-          let currentAskPQty = Option.bind currentAskOrder price_qty_of_order in
-          let newLocBid = local_best_price ?remove_order:currentBidPQty Bid symbol |> Option.map ~f:fst in
-          let newLocAsk = local_best_price ?remove_order:currentAskPQty Ask symbol |> Option.map ~f:fst in
-          let orders =
-            match !oldLocBid, !oldLocAsk, newLocBid, newLocAsk with
-            | Some oldlb, Some oldla, Some newlb, Some newla when oldlb <> oldla || newlb <> newla || newRemBid <> !oldRemBid || newRemAsk <> !oldRemAsk ->
-              update_price ~remBid:newRemBid ~remAsk:newRemAsk ~locBid:newlb ~locAsk:newla symbol strategy
-            | _ -> []
-          in
-          oldLocBid := newLocBid;
-          oldLocAsk := newLocAsk;
-          oldRemBid := newRemBid;
-          oldRemAsk := newRemAsk;
-          begin match orders with
+          let now = Time_ns.now () in
+          let time_elapsed = Time_ns.diff now !latest_update in
+          if Time_ns.Span.(time_elapsed < of_int_ms 1500) then Deferred.unit
+          else begin
+            latest_update := now;
+            let currentBidOrder = current_working_order symbol Bid in
+            let currentAskOrder = current_working_order symbol Ask in
+            let currentBidPQty = Option.bind currentBidOrder price_qty_of_order in
+            let currentAskPQty = Option.bind currentAskOrder price_qty_of_order in
+            let newLocBid = local_best_price ?remove_order:currentBidPQty Bid symbol |> Option.map ~f:fst in
+            let newLocAsk = local_best_price ?remove_order:currentAskPQty Ask symbol |> Option.map ~f:fst in
+            let orders =
+              match !oldLocBid, !oldLocAsk, newLocBid, newLocAsk with
+              | Some oldlb, Some oldla, Some newlb, Some newla when oldlb <> oldla || newlb <> newla || newRemBid <> !oldRemBid || newRemAsk <> !oldRemAsk ->
+                update_price ~remBid:newRemBid ~remAsk:newRemAsk ~locBid:newlb ~locAsk:newla symbol strategy
+              | _ -> []
+            in
+            oldLocBid := newLocBid;
+            oldLocAsk := newLocAsk;
+            oldRemBid := newRemBid;
+            oldRemAsk := newRemAsk;
+            begin match orders with
             | [] -> Deferred.unit
             | orders -> Order.update Lazy.(force order_cfg) orders >>| function
               | Ok _ -> ()
               | Error err -> Log.error log "%s" @@ Error.to_string_hum err
+            end
           end
       in
       don't_wait_for @@

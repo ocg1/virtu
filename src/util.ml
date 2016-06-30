@@ -147,3 +147,21 @@ let mk_amended_limit_order ?price ?qty ~symbol ~ticksize orderID : Yojson.Safe.j
     Option.map qty ~f:(fun qty -> "leavesQty", `Int qty);
     Option.map price ~f:(fun price -> "price", `Float (float_of_satoshis symbol ticksize price));
     ])
+
+let to_remote_sym = function
+  | "XBTUSD" -> "BTCUSD"
+  | "LTCUSD" -> "LTCUSD"
+  | "ETHXBT" -> "BTC_ETH"
+  | "LSKXBT" -> "BTC_LSK"
+  | "DAOETH" -> "ETH_DAO"
+  | "FCTXBT" -> "BTC_FCT"
+  | _  -> invalid_arg "to_remote_sym"
+
+let of_remote_sym = function
+  | "BTCUSD" -> "XBTUSD"
+  | "LTCUSD" -> "LTCUSD"
+  | "BTC_ETH" -> "ETHXBT"
+  | "BTC_LSK" -> "LSKXBT"
+  | "ETH_DAO" -> "DAOETH"
+  | "BTC_FCT" -> "FTCXBT"
+  | _  -> invalid_arg "to_remote_sym"

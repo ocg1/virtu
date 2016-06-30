@@ -38,24 +38,6 @@ let bfx_vwaps side symbol =
 
 let tickups_w = ref None
 
-let to_remote_sym = function
-  | "XBTUSD" -> "BTCUSD"
-  | "LTCUSD" -> "LTCUSD"
-  | "ETHXBT" -> "BTC_ETH"
-  | "LSKXBT" -> "BTC_LSK"
-  | "DAOETH" -> "ETH_DAO"
-  | "FCTXBT" -> "BTC_FCT"
-  | _  -> invalid_arg "to_remote_sym"
-
-let of_remote_sym = function
-  | "BTCUSD" -> "XBTUSD"
-  | "LTCUSD" -> "LTCUSD"
-  | "BTC_ETH" -> "ETHXBT"
-  | "BTC_LSK" -> "LSKXBT"
-  | "ETH_DAO" -> "DAOETH"
-  | "BTC_FCT" -> "FTCXBT"
-  | _  -> invalid_arg "to_remote_sym"
-
 let on_bfx_book_partial sym os =
   let orders = String.Table.find_exn bfx_orders sym in
   let fold_f (bids, asks) { BFX.Ws.Book.Raw.id; price; amount } =
@@ -198,7 +180,7 @@ let bfx_ws buf =
           end
         | _ -> ()
   in
-  let ws = Ws.with_connection ~log:(Lazy.force log) ~auth:(!bfx_key, !bfx_secret) ~to_ws:subscribe_r () in
+  let ws = Ws.open_connection ~log:(Lazy.force log) ~auth:(!bfx_key, !bfx_secret) ~to_ws:subscribe_r () in
   Monitor.handle_errors
     (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
     (fun exn -> error "%s" @@ Exn.to_string exn)
