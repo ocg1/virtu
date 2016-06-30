@@ -10,7 +10,7 @@ module type Cfg = sig
   val order_cfg : Order.cfg Lazy.t
 
   val orders : RespObj.t Uuid.Table.t
-  val current_orders : Side.t -> Uuid.t String.Table.t
+  val current_orders : Side.t -> order_status String.Table.t
   val quoted_instruments : instrument_info String.Table.t
 
   val ticksizes : ticksize String.Table.t
@@ -24,11 +24,13 @@ module Common (C : Cfg) = struct
 
   let current_working_order symbol side =
     let open Option.Monad_infix in
-    String.Table.find (current_orders side) symbol >>= fun oid ->
-    Uuid.Table.find orders oid >>= fun o ->
-    RespObj.int64 o "leavesQty" >>= fun leavesQty ->
-    RespObj.bool o "workingIndicator" >>= fun working ->
-    if leavesQty > 0L && working then Some o else None
+    String.Table.find (current_orders side) symbol >>= function
+    | Sent oid -> None
+    | Acked oid ->
+      Uuid.Table.find orders oid >>= fun o ->
+      RespObj.int64 o "leavesQty" >>= fun leavesQty ->
+      RespObj.bool o "workingIndicator" >>= fun working ->
+      if leavesQty > 0L && working then Some o else None
 
   let price_qty_of_order o =
     let open Option.Monad_infix in
@@ -73,7 +75,8 @@ module Blanket (C : Cfg) = struct
       ]
 
   let update_orders strategy =
-    let iter_f ~key:symbol ~data:{ ticker } =
+    let iter_f (symbol, { ticker }) =
+      let { divisor=tickSize } = String.Table.find_exn ticksizes symbol in
       let update_f =
         let oldLocBid = local_best_price Bid symbol |> Option.map ~f:fst |> Ref.create in
         let oldLocAsk = local_best_price Ask symbol |> Option.map ~f:fst |> Ref.create in
@@ -81,6 +84,8 @@ module Blanket (C : Cfg) = struct
         let oldRemAsk = ref 0 in
         let latest_update = ref Time_ns.epoch in
         fun (newRemBid, newRemAsk) ->
+          let newRemBid = newRemBid / tickSize * tickSize in
+          let newRemAsk = newRemAsk / tickSize * tickSize in
           let now = Time_ns.now () in
           let time_elapsed = Time_ns.diff now !latest_update in
           if Time_ns.Span.(time_elapsed < of_int_ms 1500) then Deferred.unit
@@ -110,10 +115,11 @@ module Blanket (C : Cfg) = struct
             end
           end
       in
-      don't_wait_for @@
       Monitor.handle_errors
         (fun () -> Pipe.iter ~continue_on_error:true ticker ~f:update_f)
         (fun exn -> Log.error log "%s" @@ Exn.to_string exn)
     in
-    String.Table.iteri quoted_instruments ~f:iter_f
+    String.Table.to_alist quoted_instruments |>
+    Deferred.List.iter ~how:`Parallel ~f:iter_f
+
 end

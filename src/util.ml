@@ -84,6 +84,11 @@ type ticksize = {
   divisor: Int.t; (* i.e. 1_000_000 *)
 } [@@deriving create]
 
+type order_status =
+  | Sent of Uuid.t
+  | Acked of Uuid.t
+  [@@deriving show]
+
 let set_sign sign i = match sign, Int.sign i with
 | Sign.Zero, _ -> invalid_arg "set_sign"
 | _, Zero -> 0
@@ -131,7 +136,7 @@ let mk_new_market_order ~symbol ~qty : Yojson.Safe.json =
     "ordType", `String "Market";
   ]
 
-let mk_new_limit_order ~symbol ~ticksize ~side ~price ~qty : Yojson.Safe.json =
+let mk_new_limit_order ~symbol ~ticksize ~side ~price ~qty =
   `Assoc [
     "clOrdID", `String Uuid.(create () |> to_string);
     "symbol", `String symbol;
@@ -141,12 +146,14 @@ let mk_new_limit_order ~symbol ~ticksize ~side ~price ~qty : Yojson.Safe.json =
     "execInst", `String "ParticipateDoNotInitiate"
   ]
 
-let mk_amended_limit_order ?price ?qty ~symbol ~ticksize orderID : Yojson.Safe.json =
+let mk_amended_limit_order ?price ?qty ~symbol ~ticksize orderID =
   `Assoc (List.filter_opt [
     Some ("orderID", `String orderID);
     Option.map qty ~f:(fun qty -> "leavesQty", `Int qty);
     Option.map price ~f:(fun price -> "price", `Float (float_of_satoshis symbol ticksize price));
     ])
+
+let clOrdID_of_json obj = Yojson.(Safe.to_basic obj |> Basic.Util.member "clOrdID" |> Basic.Util.to_string)
 
 let to_remote_sym = function
   | "XBTUSD" -> "BTCUSD"
