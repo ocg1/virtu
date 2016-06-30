@@ -8,6 +8,8 @@ open Util
 open Bs_devkit.Core
 open Bs_api.BMEX
 
+let log_ws = Log.(create ~level:`Error ~on_error:`Raise ~output:[Output.stderr ()])
+
 let api_key = ref ""
 let api_secret = ref @@ Cstruct.of_string ""
 let testnet = ref true
@@ -401,11 +403,10 @@ let market_make buf strategy instruments =
     don't_wait_for @@ dead_man's_switch 60000 15;
     S.update_orders strategy;
     Clock_ns.after @@ Time_ns.Span.of_int_ms 50 >>= fun () ->
-    Ws.with_connection
-      ~testnet:!testnet
-      ~auth:(!api_key, !api_secret)
-      ~topics
-      ~on_ws_msg ()
+    let ws = Ws.with_connection ~log:log_ws ~testnet:!testnet ~auth:(!api_key, !api_secret) ~topics () in
+    Monitor.handle_errors
+      (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
+      (fun exn -> error "%s" @@ Exn.to_string exn)
 
 let rpc_client port =
   let open Rpc in
@@ -463,7 +464,7 @@ let tickers_of_instrument = function
     )
 | _ -> invalid_arg "ticker_of_instrument"
 
-let main cfg port daemon pidfile logfile loglevel main dry_run' fixed remfixed instruments () =
+let main cfg port daemon pidfile logfile loglevel wsllevel main dry_run' fixed remfixed instruments () =
   don't_wait_for begin
     Lock_file.create_exn pidfile >>= fun () ->
     let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> presult_exn in
@@ -477,8 +478,11 @@ let main cfg port daemon pidfile logfile loglevel main dry_run' fixed remfixed i
     let instruments = if instruments = [] then quote else instruments in
     let buf = Bi_outbuf.create 4096 in
     if daemon then Daemon.daemonize ~cd:"." ();
-    set_output Log.Output.[stderr (); file `Text ~filename:logfile];
-    set_level (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
+    let log_outputs = Log.Output.[stderr (); file `Text ~filename:logfile] in
+    set_output log_outputs;
+    Log.set_output log_ws log_outputs;
+    set_level @@ loglevel_of_int loglevel;
+    Log.set_level log_ws @@ loglevel_of_int wsllevel;
     hedger_port := port;
     List.iter instruments ~f:(fun (symbol, max_pos_size) ->
         let data = create_instrument_info
@@ -514,6 +518,7 @@ let command =
     +> flag "-pidfile" (optional_with_default "run/virtu.pid" string) ~doc:"filename Path of the pid file (run/virtu.pid)"
     +> flag "-logfile" (optional_with_default "log/virtu.log" string) ~doc:"filename Path of the log file (log/virtu.log)"
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
+    +> flag "-wsllevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
     +> flag "-main" no_arg ~doc:" Use mainnet"
     +> flag "-dry" no_arg ~doc:" Simulation mode"
     +> flag "-fixed" (optional int) ~doc:"tick Post bid/ask with a fixed spread"

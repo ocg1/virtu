@@ -198,7 +198,11 @@ let bfx_ws buf =
           end
         | _ -> ()
   in
-  Ws.with_connection ~log:(Lazy.force log) ~auth:(!bfx_key, !bfx_secret) ~to_ws:subscribe_r ~on_ws_msg ()
+  let ws = Ws.with_connection ~log:(Lazy.force log) ~auth:(!bfx_key, !bfx_secret) ~to_ws:subscribe_r () in
+  Monitor.handle_errors
+    (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
+    (fun exn -> error "%s" @@ Exn.to_string exn)
+
 
 let subscribe sym xbt_v =
   String.Table.set subscriptions sym xbt_v;
@@ -282,8 +286,8 @@ let main cfg port daemon pidfile logfile loglevel instruments () =
     if daemon then Daemon.daemonize ~cd:"." ();
     set_output Log.Output.[stderr (); file `Text ~filename:logfile];
     Log.set_output log_bfx Log.Output.[stderr (); file `Text ~filename:logfile];
-    set_level (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
-    Log.set_level log_bfx (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
+    set_level @@ loglevel_of_int loglevel;
+    Log.set_level log_bfx @@ loglevel_of_int loglevel;
     List.iter instruments ~f:(fun (i, q) -> subscribe i q);
     Deferred.(all_unit [bfx_ws buf; ignore @@ rpc_server port])
   end;

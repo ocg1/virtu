@@ -103,7 +103,10 @@ module Blanket (C : Cfg) = struct
               | Error err -> Log.error log "%s" @@ Error.to_string_hum err
           end
       in
-      don't_wait_for @@ Pipe.iter ticker update_f
+      don't_wait_for @@
+      Monitor.handle_errors
+        (fun () -> Pipe.iter ~continue_on_error:true ticker ~f:update_f)
+        (fun exn -> Log.error log "%s" @@ Exn.to_string exn)
     in
     String.Table.iteri quoted_instruments ~f:iter_f
 end
