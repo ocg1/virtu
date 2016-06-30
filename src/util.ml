@@ -7,7 +7,7 @@ module Cfg = struct
   type cfg = {
     key: string;
     secret: string;
-    quote: (string * int * int) list [@default []];
+    quote: (string * int) list [@default []];
   } [@@deriving yojson]
 
   type t = (string * cfg) list [@@deriving yojson]
@@ -75,7 +75,7 @@ type instrument_info = {
   bids_initialized: unit Ivar.t;
   asks_initialized: unit Ivar.t;
   max_pos_size: int;
-  update_period: int; (* in ms *)
+  ticker: (int * int) Pipe.Reader.t;
 } [@@deriving create]
 
 type ticksize = {

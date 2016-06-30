@@ -17,12 +17,6 @@ module type Cfg = sig
   val local_best_price :
     ?remove_order:(int * int) ->
     Side.t -> string -> (int * int) option
-  val local_mid_price :
-    ?remove_bid:(int * int) ->
-    ?remove_ask:(int * int) ->
-    string -> best_price_kind -> (int * int) option
-  val remote_best_price : Side.t -> best_price_kind -> string -> Int.t option
-  val remote_mid_price : string -> best_price_kind -> (int * int) option
 end
 
 module Common (C : Cfg) = struct
@@ -62,88 +56,54 @@ module Blanket (C : Cfg) = struct
   module Common = Common(C)
   open Common
 
-  let update_orders param =
-    let iter_f ~key:symbol ~data:{ update_period } =
+  let update_price ~remBid ~remAsk ~locBid ~locAsk symbol strategy =
+    let { divisor=tickSize } = String.Table.find_exn ticksizes symbol in
+      let newBid, newAsk = match strategy with
+      | `Blanket -> locBid + tickSize, locAsk - tickSize
+      | `Fixed i -> locBid + i * tickSize, locAsk - i * tickSize
+      | `FixedRemote i ->
+          let newFixedBid = locBid + i * tickSize in
+          let newFixedAsk = locAsk - i * tickSize in
+          (if remBid > newFixedBid then Int.min remBid newFixedAsk else newFixedBid),
+          (if remAsk < newFixedAsk then Int.max remAsk newFixedAsk else newFixedAsk)
+      in
+      List.filter_opt [
+        update_orders_price symbol Bid (`Abs newBid);
+        update_orders_price symbol Ask (`Abs newAsk)
+      ]
+
+  let update_orders strategy =
+    let iter_f ~key:symbol ~data:{ ticker } =
       let update_f =
-        let oldMidPrice = ref @@ local_mid_price symbol Best in
-        let oldRemoteMidPrice = ref @@ remote_mid_price symbol Best in
-        fun () ->
-          let oldMidPrice' = !oldMidPrice in
-          let oldRemoteMidPrice' = !oldRemoteMidPrice in
-          let remoteMidPrice = remote_mid_price symbol Best in
+        let oldLocBid = local_best_price Bid symbol |> Option.map ~f:fst |> Ref.create in
+        let oldLocAsk = local_best_price Ask symbol |> Option.map ~f:fst |> Ref.create in
+        let oldRemBid = ref 0 in
+        let oldRemAsk = ref 0 in
+        fun (newRemBid, newRemAsk) ->
           let currentBidOrder = current_working_order symbol Bid in
           let currentAskOrder = current_working_order symbol Ask in
           let currentBidPQty = Option.bind currentBidOrder price_qty_of_order in
           let currentAskPQty = Option.bind currentAskOrder price_qty_of_order in
-          let midPrice = local_mid_price ?remove_bid:currentBidPQty ?remove_ask:currentAskPQty symbol Best in
-          oldMidPrice := midPrice;
-          oldRemoteMidPrice := remoteMidPrice;
-          begin match oldMidPrice', midPrice, oldRemoteMidPrice', remoteMidPrice with
-          | Some (oldm, olds), Some (newm, news), Some (oldremm, oldrems), Some (remm, rems) when oldm <> newm || oldremm <> remm ->
-            let { divisor } = String.Table.find_exn ticksizes symbol in
-            let center, spread = match param with
-            | `Blanket -> newm, news + divisor
-            | `Fixed i -> newm, i * divisor
-            | `FixedRemote i ->
-              let center =
-                let low_boundary = newm - news + i * divisor in
-                let high_boundary = newm + news - i * divisor in
-                if remm < low_boundary then low_boundary
-                else if remm > high_boundary then high_boundary
-                else remm
-              in
-              center, i * divisor
-            in
-            let orders = List.filter_opt [
-                update_orders_price symbol Bid (`Abs (center - spread));
-                update_orders_price symbol Ask (`Abs (center + spread))
-              ]
-            in
-            begin match orders with
+          let newLocBid = local_best_price ?remove_order:currentBidPQty Bid symbol |> Option.map ~f:fst in
+          let newLocAsk = local_best_price ?remove_order:currentAskPQty Ask symbol |> Option.map ~f:fst in
+          let orders =
+            match !oldLocBid, !oldLocAsk, newLocBid, newLocAsk with
+            | Some oldlb, Some oldla, Some newlb, Some newla when oldlb <> oldla || newlb <> newla || newRemBid <> !oldRemBid || newRemAsk <> !oldRemAsk ->
+              update_price ~remBid:newRemBid ~remAsk:newRemAsk ~locBid:newlb ~locAsk:newla symbol strategy
+            | _ -> []
+          in
+          oldLocBid := newLocBid;
+          oldLocAsk := newLocAsk;
+          oldRemBid := newRemBid;
+          oldRemAsk := newRemAsk;
+          begin match orders with
             | [] -> Deferred.unit
             | orders -> Order.update Lazy.(force order_cfg) orders >>| function
               | Ok _ -> ()
               | Error err -> Log.error log "%s" @@ Error.to_string_hum err
-            end
-          | _ -> Deferred.unit
-          end;
+          end
       in
-      Clock_ns.run_at_intervals' (Time_ns.Span.of_int_ms update_period) update_f
-    in
-    String.Table.iteri quoted_instruments ~f:iter_f
-end
-
-module FollowBFX (C : Cfg) = struct
-  open C
-  module Common = Common(C)
-  open Common
-
-  let update_orders () =
-    let iter_f ~key:symbol ~data:{ update_period } =
-      let update_f =
-        let old_best_bid = ref @@ remote_best_price Bid Vwap symbol in
-        let old_best_ask = ref @@ remote_best_price Ask Vwap symbol in
-        fun () ->
-          let new_best_bid = remote_best_price Bid Vwap symbol in
-          let new_best_ask = remote_best_price Ask Vwap symbol in
-          let amended_bid =
-            Option.(map2 !old_best_bid new_best_bid (fun old_bb bb ->
-                update_orders_price symbol Bid (`Diff (bb - old_bb))) |> join)
-          in
-          let amended_ask =
-            Option.(map2 !old_best_ask new_best_ask (fun old_ba ba ->
-                update_orders_price symbol Ask (`Diff (ba - old_ba))) |> join)
-          in
-          old_best_bid := new_best_bid;
-          old_best_ask := new_best_ask;
-          let orders = List.filter_opt [amended_bid; amended_ask] in
-          match orders with
-          | [] -> Deferred.unit
-          | orders -> Order.update Lazy.(force order_cfg) orders >>| function
-            | Ok _ -> ()
-            | Error err -> Log.error log "%s" @@ Error.to_string_hum err
-      in
-      Clock_ns.run_at_intervals' (Time_ns.Span.of_int_ms update_period) update_f
+      don't_wait_for @@ Pipe.iter ticker update_f
     in
     String.Table.iteri quoted_instruments ~f:iter_f
 end

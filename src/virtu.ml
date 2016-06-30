@@ -45,27 +45,6 @@ let current_orders = function
   | Side.Bid -> current_bids
   | Ask -> current_asks
 
-module RemoteOB = struct
-  type best_price = { best: int; vwap: int } [@@deriving create]
-
-  let bids : best_price String.Table.t = String.Table.create ()
-  let asks : best_price String.Table.t = String.Table.create ()
-
-  let book_of_side = function Side.Bid -> bids | Ask -> asks
-
-  let best_price side kind symbol =
-    let open Option.Monad_infix in
-    String.Table.find (book_of_side side) symbol >>| fun { best; vwap } ->
-    match kind with Best -> best | Vwap -> vwap
-
-  let mid_price symbol kind =
-    Option.map2 (best_price Bid kind symbol) (best_price Ask kind symbol)
-      ~f:(fun bb ba ->
-          let midPrice = (bb + ba) / 2 in
-          midPrice, ba - midPrice
-        )
-end
-
 module OB = struct
   type order = { price: int; qty: int }
   let orders : (order Int.Table.t) String.Table.t = String.Table.create ()
@@ -134,8 +113,6 @@ module S = Strategy.Blanket(struct
     let ticksizes = ticksizes
     let local_best_price = OB.best_price
     let local_mid_price = OB.mid_price
-    let remote_best_price = RemoteOB.best_price
-    let remote_mid_price = RemoteOB.mid_price
   end)
 
 let dead_man's_switch timeout period =
@@ -202,11 +179,6 @@ let on_position_update symbol oldp p =
         end
       end
     | _ -> info "on_position_update: waiting for %s orderBookL2" symbol
-
-let on_ticker_update { Protocols.OrderBook.symbol; side; best; vwap } =
-  (* debug "<- tickup %s %s %d %d" symbol (Side.show side) (best / 1_000_000) (vwap / 1_000_000); *)
-  let rtickers = RemoteOB.book_of_side side in
-  String.Table.set rtickers symbol (RemoteOB.create_best_price ~best ~vwap ())
 
 let on_instrument action data =
   let on_partial_insert i =
@@ -441,7 +413,7 @@ let rpc_client port =
   let on_msg = function
   | OrderBook.Subscribed (sym, max_pos) ->
     info "hedger subscribed to %s %d" sym max_pos;
-  | Ticker t -> on_ticker_update t
+  | Ticker t -> ()
   in
   let client_f c =
     let quoted_instrs = String.Table.to_alist quoted_instruments in
@@ -482,6 +454,15 @@ let rpc_client port =
         Clock_ns.after @@ Time_ns.Span.of_int_sec 5 >>= loop
   in loop ()
 
+let tickers_of_instrument = function
+| "XBTUSD" ->
+  Pipe.map (Ws.Kaiko.tickers ()) ~f:(fun { index={ bid; ask } } ->
+      debug "Kaiko %s %s" bid ask;
+      satoshis_int_of_float_exn @@ Float.of_string bid,
+      satoshis_int_of_float_exn @@ Float.of_string ask
+    )
+| _ -> invalid_arg "ticker_of_instrument"
+
 let main cfg port daemon pidfile logfile loglevel main dry_run' fixed remfixed instruments () =
   don't_wait_for begin
     Lock_file.create_exn pidfile >>= fun () ->
@@ -499,9 +480,15 @@ let main cfg port daemon pidfile logfile loglevel main dry_run' fixed remfixed i
     set_output Log.Output.[stderr (); file `Text ~filename:logfile];
     set_level (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
     hedger_port := port;
-    List.iter instruments ~f:(fun (k, v, p) ->
-        String.Table.set quoted_instruments ~key:k
-          ~data:Ivar.(create_instrument_info (create ()) (create ()) v p ())
+    List.iter instruments ~f:(fun (symbol, max_pos_size) ->
+        let data = create_instrument_info
+            ~bids_initialized:(Ivar.create ())
+            ~asks_initialized:(Ivar.create ())
+            ~max_pos_size
+            ~ticker:(tickers_of_instrument symbol)
+            ()
+        in
+        String.Table.set quoted_instruments ~key:symbol ~data
       );
     info "Virtu starting";
     let strategy = match fixed, remfixed with
@@ -510,7 +497,7 @@ let main cfg port daemon pidfile logfile loglevel main dry_run' fixed remfixed i
     | _, Some remfixed -> `FixedRemote remfixed
     in
     Deferred.(all_unit [
-        ignore @@ rpc_client port;
+        (* ignore @@ rpc_client port; *)
         market_make buf strategy @@ String.Table.keys quoted_instruments;
       ]);
   end;
@@ -531,7 +518,7 @@ let command =
     +> flag "-dry" no_arg ~doc:" Simulation mode"
     +> flag "-fixed" (optional int) ~doc:"tick Post bid/ask with a fixed spread"
     +> flag "-fixed-remote" (optional int) ~doc:"tick Post bid/ask with a fixed spread"
-    +> anon (sequence (t3 ("instrument" %: string) ("quote" %: int) ("period" %: int)))
+    +> anon (sequence (t2 ("instrument" %: string) ("quote" %: int)))
   in
   Command.basic ~summary:"Market maker bot" spec main
 
