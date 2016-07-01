@@ -131,17 +131,17 @@ let compute_orders symbol side price order newQty =
   let leavesQty = Option.map order ~f:(fun o -> RespObj.int64_exn o "leavesQty" |> Int64.to_int_exn) in
   let ticksize = String.Table.find_exn ticksizes symbol in
   let leavesQtySexp = Option.sexp_of_t Int.sexp_of_t leavesQty |> Sexp.to_string_hum in
-  debug "compute_orders %s %s %d %s %d" symbol (Side.show side) price leavesQtySexp newQty;
+  debug "compute_orders %s %s %d %s %d" symbol (Side.show side) (price / ticksize.divisor) leavesQtySexp newQty;
   match leavesQty with
   | None when newQty > 0 -> Option.some @@ mk_new_limit_order ~symbol ~side ~ticksize ~price ~qty:newQty, None
   | Some _ -> None, Option.some @@ mk_amended_limit_order ~symbol ~ticksize ~price ~qty:newQty Option.(value_exn orderID)
   | _ -> None, None
 
-let on_position_update symbol oldp p =
+let on_position_update action symbol oldp p =
   let { max_pos_size } = String.Table.find_exn quoted_instruments symbol in
   let oldQty = Option.value_map oldp ~default:0 ~f:(fun oldp -> RespObj.int64_exn oldp "currentQty" |> Int64.to_int_exn) in
   let currentQty = RespObj.int64_exn p "currentQty" |> Int64.to_int_exn in
-  debug "<- update position %s %d -> %d" symbol oldQty currentQty;
+  debug "<- [P] %s %s %d -> %d" (show_update_action action) symbol oldQty currentQty;
   let bidOrderID = String.Table.find current_bids symbol in
   let askOrderID = String.Table.find current_asks symbol in
   begin match bidOrderID, askOrderID with
@@ -162,9 +162,9 @@ let on_position_update symbol oldp p =
   let newAskQty = Int.max (max_pos_size + currentQty) 0 in
   if currentBidQty = newBidQty && currentAskQty = newAskQty then failwithf "position unchanged" ();
   info "target position: bid %d -> %d, ask %d -> %d" currentBidQty newBidQty currentAskQty newAskQty;
-  info "current orders: (%s) (%s)"
-    (Option.value_map bidOrderID ~default:"" ~f:show_order_status)
-    (Option.value_map askOrderID ~default:"" ~f:show_order_status);
+  info "current orders: %s %s"
+    (Option.sexp_of_t sexp_of_order_status bidOrderID |> Sexp.to_string_hum)
+    (Option.sexp_of_t sexp_of_order_status askOrderID |> Sexp.to_string_hum);
   let bidOrder = Option.bind bidOrderID (function Acked uuid -> Uuid.Table.find orders uuid | _ -> None) in
   let askOrder = Option.bind askOrderID (function Acked uuid -> Uuid.Table.find orders uuid | _ -> None) in
   let bidSubmit, bidAmend = compute_orders symbol Bid bestBid bidOrder newBidQty in
@@ -175,13 +175,13 @@ let on_position_update symbol oldp p =
   | [] -> Deferred.unit
   | orders -> Order.submit !order_cfg orders >>| function
     | Ok _ -> ()
-    | Error err -> error "%s" @@ Error.to_string_hum err
+    | Error err -> error "on_position_update: %s: %s" (Yojson.Safe.to_string (`List orders)) (Error.to_string_hum err)
   in
   let amend_th = match List.filter_opt [bidAmend; askAmend] with
   | [] -> Deferred.unit
   | orders -> Order.update !order_cfg orders >>| function
     | Ok _ -> ()
-    | Error err -> error "%s" @@ Error.to_string_hum err
+    | Error err -> error "on_position_update: %s: %s" (Yojson.Safe.to_string (`List orders)) (Error.to_string_hum err)
   in
   Deferred.all_unit [submit_th; amend_th]
 
@@ -213,12 +213,16 @@ let on_instrument action data =
   end
 
 let on_order action data =
+  let flag_unknown = function "" -> "U" | _ -> "" in
   let on_partial o =
     let o = RespObj.of_json o in
+    let sym = RespObj.string_exn o "symbol" in
     let oid_str = RespObj.string_exn o "orderID" in
     let clOrdID_str = RespObj.string_exn o "clOrdID" in
-    debug "<- partial order %s (%s)" oid_str clOrdID_str;
-    Uuid.Table.set orders Uuid.(of_string oid_str) o;
+    let side_str = RespObj.string_exn o "side" in
+    let oid = Uuid.of_string oid_str in
+    debug "<- [O] %s %s %s %s %s" (show_update_action action) sym side_str (String.sub oid_str 0 8) (flag_unknown clOrdID_str);
+    Uuid.Table.set orders oid o;
     Deferred.unit
   in
   let on_insert_update action o =
@@ -230,8 +234,8 @@ let on_order action data =
     let o = RespObj.merge old_o o in
     Uuid.Table.set orders ~key:oid ~data:o;
     let clOrdID_str = RespObj.string_exn o "clOrdID" in
-    debug "<- %s order %s (%s)" (show_update_action action) oid_str clOrdID_str;
     let side_str = RespObj.string_exn o "side" in
+    debug "<- [O] %s %s %s %s %s" (show_update_action action) sym side_str (String.sub oid_str 0 8) (flag_unknown clOrdID_str);
     let side = buy_sell_of_bmex side_str in
     let workingIndicator = RespObj.bool_exn o "workingIndicator" in
     let current_table, current_ivar = match side with
@@ -242,7 +246,7 @@ let on_order action data =
       if not workingIndicator then
         String.Table.remove current_table sym
       else begin
-        debug "set %s as current %s" oid_str side_str;
+        debug "[O] %s %s := %s" sym side_str @@ String.sub oid_str 0 8;
         String.Table.set current_table ~key:sym ~data:(Acked oid);
         Ivar.fill_if_empty current_ivar ()
       end
@@ -252,8 +256,10 @@ let on_order action data =
     let o = RespObj.of_json o in
     let oid_str = RespObj.string_exn o "orderID" in
     let clOrdID_str = RespObj.string_exn o "clOrdID" in
-    debug "<- delete order %s (%s)" oid_str clOrdID_str;
-    Uuid.Table.remove orders Uuid.(of_string oid_str)
+    let side_str = RespObj.string_exn o "side" in
+    let oid = Uuid.of_string oid_str in
+    debug "<- [O] %s %s %s %s" (show_update_action action) side_str (String.sub oid_str 0 8) (flag_unknown clOrdID_str);
+    Uuid.Table.remove orders oid
   in
   begin match action with
   | Partial ->
@@ -267,7 +273,7 @@ let on_order action data =
   end
 
 let on_position action data =
-  let on_update p =
+  let on_not_delete action p =
     let p = RespObj.of_json p in
     let sym = RespObj.string_exn p "symbol" in
     if not @@ String.Table.mem quoted_instruments sym then Deferred.unit
@@ -277,23 +283,23 @@ let on_position action data =
         ~default:p ~f:(fun oldp -> RespObj.merge oldp p)
     in
     String.Table.set positions sym p;
-    try_with (fun () -> on_position_update sym oldp p) >>| function
+    try_with (fun () -> on_position_update action sym oldp p) >>| function
     | Ok () -> ()
     | Error exn -> match Monitor.extract_exn exn with
-    | Failure reason -> info "%s" reason
+    | Failure reason -> info "[P] %s" reason
     | _ -> error "%s" @@ Exn.(to_string exn)
   in
   let on_delete p =
     let p = RespObj.of_json p in
     let sym = RespObj.string_exn p "symbol" in
     if String.Table.mem quoted_instruments sym then begin
-      debug "<- delete position %s" sym;
+      debug "<- [P] %s %s" (show_update_action action) sym;
       String.Table.remove positions sym
     end
   in
   match action with
   | Delete -> List.iter data ~f:on_delete; Deferred.unit
-  | _ -> Deferred.List.iter data ~how:`Sequential ~f:on_update
+  | _ -> Deferred.List.iter data ~how:`Sequential ~f:(on_not_delete action)
 
 let on_orderbook action data =
   (* debug "<- %s" (Yojson.Safe.to_string (`List data)); *)
@@ -301,8 +307,7 @@ let on_orderbook action data =
   let of_json json =
     match OrderBook.L2.of_yojson json with
     | `Ok u -> u
-    | `Error reason ->
-      failwithf "%s: %s (%s)" reason Yojson.Safe.(to_string json) action_str ()
+    | `Error reason -> failwithf "%s: %s (%s)" reason Yojson.Safe.(to_string json) action_str ()
   in
   let update_depth action old_book { OrderBook.L2.symbol; id; side = side_str; price = new_price; size = new_qty } =
     let orders = String.Table.find_exn OB.orders symbol in
@@ -360,14 +365,13 @@ let on_orderbook action data =
     String.Table.set vwaps ~key:h.symbol ~data:(OB.create_vwap ~max_pos_p ~total_v ());
     if total_v > 0 then
       let { divisor } = String.Table.find_exn ticksizes h.symbol in
-      info "BMEX %s %s %d %d %d"
+      info "[OB] %s %s %d %d"
         h.symbol (Side.show side)
         (Option.value_map (best_elt_f new_book) ~default:0 ~f:(fun (v, _) -> v / divisor))
-        (max_pos_p / total_v / divisor)
-        total_v;
+        (max_pos_p / total_v / divisor);
 
     if action = Partial then begin
-      debug "%s %s initialized" h.symbol (Side.show side);
+      debug "[OB] %s %s initialized" h.symbol (Side.show side);
       let { bids_initialized; asks_initialized } = String.Table.find_exn quoted_instruments h.symbol in
       match side with
       | Bid -> Ivar.fill_if_empty bids_initialized ()
@@ -468,7 +472,7 @@ let rpc_client port =
 let tickers_of_instrument = function
 | "XBTUSD" ->
   Pipe.map (Ws.Kaiko.tickers ()) ~f:(fun { index={ bid; ask } } ->
-      debug "Kaiko %s %s" bid ask;
+      debug "[T] Kaiko %s %s" bid ask;
       satoshis_int_of_float_exn @@ Float.of_string bid,
       satoshis_int_of_float_exn @@ Float.of_string ask
     )
@@ -479,7 +483,7 @@ let tickers_of_instrument = function
       let { Ws.symbol; bid; ask } = Ws.ticker_of_json @@ `List event.args in
       if symbol <> to_remote_sym "ETHXBT" then None
       else begin
-        debug "PLNX %s %f %f" symbol bid ask;
+        debug "[T] PLNX %s %f %f" symbol bid ask;
         Some (satoshis_int_of_float_exn bid, satoshis_int_of_float_exn ask)
       end
     )
@@ -517,7 +521,7 @@ let main cfg port daemon pidfile logfile loglevel wsllevel main dry_run' fixed r
       );
     info "Virtu starting";
     let strategy = match fixed, remfixed with
-    | None, None -> `Blanket
+    | None, None -> `Fixed 1
     | Some fixed, _ -> `Fixed fixed
     | _, Some remfixed -> `FixedRemote remfixed
     in

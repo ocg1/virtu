@@ -38,14 +38,13 @@ module Common (C : Cfg) = struct
     RespObj.int64 o "leavesQty" >>| fun leavesQty ->
     satoshis_int_of_float_exn price, Int64.to_int_exn leavesQty
 
-  let update_orders_price symbol side dprice =
+  let update_orders_price symbol side dprice tickSize =
     let mk_order o =
       let oid = RespObj.string_exn o "orderID" in
       let old_price = satoshis_int_of_float_exn @@ RespObj.float_exn o "price" in
       let new_price = match dprice with `Abs p -> p | `Diff dp -> old_price + dp in
       if old_price = new_price then None else begin
-        Log.info log "update order price %s %s %s %d -> %d"
-          symbol (Side.show side) oid old_price new_price;
+        Log.info log "update order price %s %s %s %d -> %d" symbol (Side.show side) (String.sub oid 0 8) (old_price / tickSize) (new_price / tickSize);
         let ticksize = String.Table.find_exn ticksizes symbol in
         Option.some @@ mk_amended_limit_order ~symbol ~ticksize ~price:new_price oid
       end
@@ -111,9 +110,9 @@ module Blanket (C : Cfg) = struct
             oldRemAsk := newRemAsk;
             begin match orders with
             | [] -> Deferred.unit
-            | orders -> Order.update Lazy.(force order_cfg) orders >>| function
+            | _ -> Order.update Lazy.(force order_cfg) orders >>| function
               | Ok _ -> ()
-              | Error err -> Log.error log "%s" @@ Error.to_string_hum err
+              | Error err -> Log.error log "strategy: %s: %s" (Yojson.Safe.to_string (`List orders)) (Error.to_string_hum err)
             end
           end
       in

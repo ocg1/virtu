@@ -87,7 +87,7 @@ type ticksize = {
 type order_status =
   | Sent of Uuid.t
   | Acked of Uuid.t
-  [@@deriving show]
+  [@@deriving sexp]
 
 let set_sign sign i = match sign, Int.sign i with
 | Sign.Zero, _ -> invalid_arg "set_sign"
