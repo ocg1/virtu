@@ -60,19 +60,21 @@ module Blanket (C : Cfg) = struct
 
   let update_price ~remBid ~remAsk ~locBid ~locAsk symbol strategy =
     let { divisor=tickSize } = String.Table.find_exn ticksizes symbol in
-      let newBid, newAsk = match strategy with
-      | `Blanket -> locBid + tickSize, locAsk - tickSize
-      | `Fixed i -> locBid + i * tickSize, locAsk - i * tickSize
-      | `FixedRemote i ->
-          let newFixedBid = locBid + i * tickSize in
-          let newFixedAsk = locAsk - i * tickSize in
-          (if remBid > newFixedBid then Int.min remBid newFixedAsk else newFixedBid),
-          (if remAsk < newFixedAsk then Int.max remAsk newFixedAsk else newFixedAsk)
-      in
-      List.filter_opt [
-        update_orders_price symbol Bid (`Abs newBid);
-        update_orders_price symbol Ask (`Abs newAsk)
-      ]
+    let newBid, newAsk = match strategy with
+    | `Fixed i -> locBid + i * tickSize, locAsk - i * tickSize
+    | `FixedRemote i ->
+      let newFixedBid = locBid + i * tickSize in
+      let newFixedAsk = locAsk - i * tickSize in
+      (if remBid > newFixedBid then Int.min remBid newFixedAsk else newFixedBid),
+      (if remAsk < newFixedAsk then Int.max remAsk newFixedAsk else newFixedAsk)
+    in
+    let newBid = Int.(min newBid @@ pred locAsk) in
+    let newAsk = Int.(max newAsk @@ succ locBid) in
+    let newAsk = Int.(max newAsk @@ succ newBid) in
+    List.filter_opt [
+      update_orders_price symbol Bid (`Abs newBid) tickSize;
+      update_orders_price symbol Ask (`Abs newAsk) tickSize
+    ]
 
   let update_orders strategy =
     let iter_f (symbol, { ticker }) =
