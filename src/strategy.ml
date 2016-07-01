@@ -67,9 +67,9 @@ module Blanket (C : Cfg) = struct
       (if remBid > newFixedBid then Int.min remBid newFixedAsk else newFixedBid),
       (if remAsk < newFixedAsk then Int.max remAsk newFixedAsk else newFixedAsk)
     in
-    let newBid = Int.(min newBid @@ pred locAsk) in
-    let newAsk = Int.(max newAsk @@ succ locBid) in
-    let newAsk = Int.(max newAsk @@ succ newBid) in
+    let newBid = Int.(min newBid @@ locAsk - tickSize) in
+    let newAsk = Int.(max newAsk @@ locBid + tickSize) in
+    let newAsk = Int.(max newAsk @@ newBid + tickSize) in
     List.filter_opt [
       update_orders_price symbol Bid (`Abs newBid) tickSize;
       update_orders_price symbol Ask (`Abs newAsk) tickSize
