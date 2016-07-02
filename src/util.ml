@@ -2,6 +2,7 @@ open Core.Std
 open Async.Std
 
 open Bs_devkit.Core
+open Bs_api.BMEX
 
 module Cfg = struct
   type cfg = {
@@ -16,64 +17,99 @@ end
 module Order = struct
   type cfg = {
     dry_run: bool [@default false];
+    orders_t: RespObj.t Uuid.Table.t [@default Uuid.Table.create ()];
+    current_bids: RespObj.t String.Table.t [@default String.Table.create ()];
+    current_asks: RespObj.t String.Table.t [@default String.Table.create ()];
     testnet: bool [@default true];
     key: string [@default ""];
     secret: Cstruct.t [@default Cstruct.of_string ""];
     log: Log.t option;
   } [@@deriving create]
 
-  let submit { dry_run; testnet; key; secret; log } orders =
-    if orders = [] then Deferred.Or_error.error_string "no orders submitted"
-    else if dry_run then
+  let oid_of_respobj o = match RespObj.(string o "clOrdID", string o "orderID") with
+  | Some clOrdID, _ when clOrdID <> "" -> `C, clOrdID
+  | _, Some orderID when orderID <> "" -> `S, orderID
+  | _ -> invalid_arg "oid_of_respobj"
+
+  let submit cfg orders =
+    if orders = [] then invalid_arg "submit: empty orders";
+    if cfg.dry_run then
       Deferred.Or_error.return @@
       Printf.sprintf "[Sim] submitted %s" Yojson.Safe.(to_string @@ `List orders)
     else
     Monitor.try_with_or_error ~name:"Order.submit" (fun () ->
-        Bs_api.BMEX.Rest.Order.submit ?log ~testnet ~key ~secret orders
-      )
+        Bs_api.BMEX.Rest.Order.submit ?log:cfg.log
+          ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders
+      ) >>| function
+    | Ok res ->
+      List.iter orders ~f:(fun o ->
+          let o = RespObj.of_json o in
+          let sym = RespObj.string_exn o "symbol" in
+          let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
+          let current_table = match side with `Buy -> cfg.current_bids | `Sell -> cfg.current_asks in
+          String.Table.set current_table sym o
+        );
+      Ok res
+    | Error err ->
+      List.iter orders ~f:(fun o ->
+          let o = RespObj.of_json o in
+          let sym = RespObj.string_exn o "symbol" in
+          let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
+          let current_table = match side with `Buy -> cfg.current_bids | `Sell -> cfg.current_asks in
+          String.Table.remove current_table sym;
+        );
+      Error err
 
-  let update { dry_run; testnet; key; secret; log } orders =
-    if orders = [] then Deferred.Or_error.error_string "no orders submitted"
-    else if dry_run then
+  let update cfg orders =
+    if orders = [] then invalid_arg "update: empty orders";
+    if cfg.dry_run then
       Deferred.Or_error.return @@
       Printf.sprintf "[Sim] updated %s" Yojson.Safe.(to_string @@ `List orders)
     else
     Monitor.try_with_or_error ~name:"Order.update" (fun () ->
-        Bs_api.BMEX.Rest.Order.update ?log ~testnet ~key ~secret orders
-      )
+        Bs_api.BMEX.Rest.Order.update ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders
+      ) >>| function
+    | Error err -> Error err
+    | Ok res -> List.iter orders ~f:(fun o ->
+        let o = RespObj.of_json o in
+        let orig, oid_str = oid_of_respobj o in
+        match Uuid.Table.find cfg.orders_t Uuid.(of_string oid_str) with
+        | None -> ()
+        | Some o ->
+          let sym = RespObj.string_exn o "symbol" in
+          let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
+          let current_table = match side with `Buy -> cfg.current_bids | `Sell -> cfg.current_asks in
+          String.Table.update current_table sym ~f:(function
+            | Some old_o -> RespObj.merge old_o o
+            | None -> o)
+      );
+      Ok res
 
-  let cancel { dry_run; testnet; key; secret; log } orderID =
-    if dry_run then
-      Deferred.Or_error.return @@
-      Printf.sprintf "[Sim] canceled %s" @@ Uuid.to_string orderID
-    else
-    Monitor.try_with_or_error ~name:"Order.cancel" (fun () ->
-        Bs_api.BMEX.Rest.Order.cancel ?log ~testnet ~key ~secret orderID
-      )
-
-  let cancel_all ?symbol ?filter { dry_run; testnet; key; secret; log } =
-    if dry_run then
+  let cancel_all ?symbol ?filter cfg =
+    if cfg.dry_run then begin
+      String.Table.clear cfg.current_bids;
+      String.Table.clear cfg.current_asks;
       Deferred.Or_error.return "[Sim] canceled all orders"
+    end
     else
     Monitor.try_with_or_error ~name:"Order.cancel_all" (fun () ->
-        Bs_api.BMEX.Rest.Order.cancel_all ?log ~testnet ~key ~secret ?symbol ?filter ()
+        Bs_api.BMEX.Rest.Order.cancel_all ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret ?symbol ?filter ()
       )
 
-  let cancel_all_after { dry_run; testnet; key; secret; log } timeout =
-    if dry_run then
-      Deferred.Or_error.return @@
-      Printf.sprintf "[Sim] cancel all after %d" timeout
+  let cancel_all_after cfg timeout =
+    if cfg.dry_run then
+      Deferred.Or_error.return @@ Printf.sprintf "[Sim] cancel all after %d" timeout
     else
     Monitor.try_with_or_error ~name:"Order.cancel_all_after" (fun () ->
-        Bs_api.BMEX.Rest.Order.cancel_all_after ?log ~testnet ~key ~secret timeout
+        Bs_api.BMEX.Rest.Order.cancel_all_after ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret timeout
       )
 end
 
 type best_price_kind = Best | Vwap
 
 type instrument_info = {
-  bids_initialized: unit Ivar.t;
-  asks_initialized: unit Ivar.t;
+  bids_initialized: unit Ivar.t [@default Ivar.create ()];
+  asks_initialized: unit Ivar.t [@default Ivar.create ()];
   max_pos_size: int;
   ticker: (int * int) Pipe.Reader.t;
 } [@@deriving create]
@@ -83,11 +119,6 @@ type ticksize = {
   mult_exponent: Int.t; (* 0.01 -> -2 *)
   divisor: Int.t; (* i.e. 1_000_000 *)
 } [@@deriving create]
-
-type order_status =
-  | Sent of Uuid.t
-  | Acked of Uuid.t
-  [@@deriving sexp]
 
 let set_sign sign i = match sign, Int.sign i with
 | Sign.Zero, _ -> invalid_arg "set_sign"
@@ -136,9 +167,9 @@ let mk_new_market_order ~symbol ~qty : Yojson.Safe.json =
     "ordType", `String "Market";
   ]
 
-let mk_new_limit_order ~symbol ~ticksize ~side ~price ~qty =
+let mk_new_limit_order ~symbol ~ticksize ~side ~price ~qty uuid_str =
   `Assoc [
-    "clOrdID", `String Uuid.(create () |> to_string);
+    "clOrdID", `String uuid_str;
     "symbol", `String symbol;
     "side", `String (match side with Side.Bid -> "Buy" | Ask -> "Sell");
     "price", `Float (float_of_satoshis symbol ticksize price);
@@ -152,8 +183,6 @@ let mk_amended_limit_order ?price ?qty ~symbol ~ticksize orderID =
     Option.map qty ~f:(fun qty -> "leavesQty", `Int qty);
     Option.map price ~f:(fun price -> "price", `Float (float_of_satoshis symbol ticksize price));
     ])
-
-let clOrdID_of_json obj = Yojson.(Safe.to_basic obj |> Basic.Util.member "clOrdID" |> Basic.Util.to_string)
 
 let to_remote_sym = function
   | "XBTUSD" -> "BTCUSD"

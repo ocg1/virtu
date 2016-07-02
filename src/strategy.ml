@@ -9,8 +9,8 @@ module type Cfg = sig
   val log : Log.t
   val order_cfg : Order.cfg Lazy.t
 
-  val orders : RespObj.t Uuid.Table.t
-  val current_orders : Side.t -> order_status String.Table.t
+  val current_bids : RespObj.t String.Table.t
+  val current_asks : RespObj.t String.Table.t
   val quoted_instruments : instrument_info String.Table.t
 
   val ticksizes : ticksize String.Table.t
@@ -24,13 +24,11 @@ module Common (C : Cfg) = struct
 
   let current_working_order symbol side =
     let open Option.Monad_infix in
-    String.Table.find (current_orders side) symbol >>= function
-    | Sent oid -> None
-    | Acked oid ->
-      Uuid.Table.find orders oid >>= fun o ->
-      RespObj.int64 o "leavesQty" >>= fun leavesQty ->
-      RespObj.bool o "workingIndicator" >>= fun working ->
-      if leavesQty > 0L && working then Some o else None
+    let current_orders = match side with Side.Bid -> current_bids | Ask -> current_asks in
+    String.Table.find current_orders symbol >>= fun o ->
+    RespObj.int64 o "leavesQty" >>= fun leavesQty ->
+    RespObj.bool o "workingIndicator" >>= fun working ->
+    if leavesQty > 0L && working then Some o else None
 
   let price_qty_of_order o =
     let open Option.Monad_infix in
@@ -116,7 +114,7 @@ module Blanket (C : Cfg) = struct
             end
           end
       in
-      Monitor.handle_errors
+      Monitor.handle_errors ~name:"update_orders"
         (fun () -> Pipe.iter ~continue_on_error:true ticker ~f:update_f)
         (fun exn -> Log.error log "%s" @@ Exn.to_string exn)
     in
