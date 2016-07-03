@@ -200,3 +200,9 @@ let of_remote_sym = function
   | "ETH_DAO" -> "DAOETH"
   | "BTC_FCT" -> "FTCXBT"
   | _  -> invalid_arg "to_remote_sym"
+
+let price_qty_of_order o =
+  let open Option.Monad_infix in
+  RespObj.float o "price" >>= fun price ->
+  RespObj.int64 o "leavesQty" >>| fun leavesQty ->
+  satoshis_int_of_float_exn price, Int64.to_int_exn leavesQty

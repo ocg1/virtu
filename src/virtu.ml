@@ -117,7 +117,7 @@ let dead_man's_switch timeout period =
     | Ok _ -> Clock_ns.after @@ Time_ns.Span.of_int_sec period >>= loop
   in loop ()
 
-let compute_orders symbol side price order newQty =
+let compute_orders ?order symbol side price newQty =
   let leavesQty = Option.map order ~f:(fun o -> RespObj.int64_exn o "leavesQty" |> Int64.to_int_exn) in
   let ticksize = String.Table.find_exn ticksizes symbol in
   let leavesQtySexp = Option.sexp_of_t Int.sexp_of_t leavesQty |> Sexp.to_string_hum in
@@ -128,7 +128,7 @@ let compute_orders symbol side price order newQty =
     Option.some (clOrdID, mk_new_limit_order ~symbol ~side ~ticksize ~price ~qty:newQty clOrdID), None
   | Some _ ->
     let orig, oid = Order.oid_of_respobj (Option.value_exn order) in
-    None, Option.some (oid, mk_amended_limit_order ~symbol ~ticksize ~qty:newQty orig oid)
+    None, Option.some (oid, mk_amended_limit_order ~symbol ~ticksize ~price ~qty:newQty orig oid)
   | _ -> None, None
 
 let string_of_order = function
@@ -153,10 +153,6 @@ let on_position_update action symbol oldp p =
   end;
   (* let fw_p_to_hedger c = Rpc.Rpc.dispatch Protocols.Position.t c (symbol, currentQty) in *)
   (* don't_wait_for @@ Deferred.ignore @@ Rpc.Connection.with_client ~host:"localhost" ~port:!hedger_port fw_p_to_hedger; *)
-  let bestBid = OB.best_price Bid symbol in
-  let bestAsk = OB.best_price Ask symbol in
-  let bestBid = Option.value_map bestBid ~default:0 ~f:fst in
-  let bestAsk = Option.value_map bestAsk ~default:0 ~f:fst in
   let currentBidQty = Option.value_map (RespObj.int64 p "openOrderBuyQty") ~default:0 ~f:Int64.to_int_exn in
   let currentAskQty = Option.value_map (RespObj.int64 p "openOrderSellQty") ~default:0 ~f:Int64.to_int_exn in
   let newBidQty = Int.max (max_pos_size - currentQty) 0 in
@@ -166,8 +162,18 @@ let on_position_update action symbol oldp p =
   info "current orders: %s %s" (string_of_order currentBid) (string_of_order currentAsk);
   let currentBid = Option.bind currentBid (fun o -> if is_in_flight o then None else Some o) in
   let currentAsk = Option.bind currentAsk (fun o -> if is_in_flight o then None else Some o) in
-  let bidSubmit, bidAmend = compute_orders symbol Bid bestBid currentBid newBidQty in
-  let askSubmit, askAmend = compute_orders symbol Ask bestAsk currentAsk newAskQty in
+  let bidPrice = match Option.(currentBid >>= price_qty_of_order), OB.best_price Bid symbol with
+  | Some (price, _qty), _ -> price
+  | None, Some (price, _qty) -> price
+  | _ -> failwith "No suitable bid price found"
+  in
+  let askPrice = match Option.(currentAsk >>= price_qty_of_order), OB.best_price Ask symbol with
+  | Some (price, _qty), _ -> price
+  | None, Some (price, _qty) -> price
+  | _ -> failwith "No suitable ask price found"
+  in
+  let bidSubmit, bidAmend = compute_orders ?order:currentBid symbol Bid bidPrice newBidQty in
+  let askSubmit, askAmend = compute_orders ?order:currentAsk symbol Ask askPrice newAskQty in
   let submit_th = match
     List.fold_left [bidSubmit; askSubmit] ~init:[]
       ~f:(fun a -> function None -> a | Some (_, o) -> o :: a)
@@ -236,18 +242,11 @@ let on_order action data =
     Uuid.Table.set orders oid o;
     let side_str = RespObj.string_exn o "side" in
     debug "[O] %s %s %s %s" (show_update_action action) sym side_str (String.sub oid_str 0 8);
-    let workingIndicator = RespObj.bool_exn o "workingIndicator" in
     let side = buy_sell_of_bmex side_str in
     let current_table = match side with `Buy -> current_bids | `Sell -> current_asks in
     if ordOrig = `C then begin
-      if not workingIndicator then begin
-        debug "[O] Removing %s" @@ Yojson.Safe.to_string o_json;
-        String.Table.remove current_table sym
-      end
-      else begin
-        debug "[O] %s %s := %s" sym side_str @@ String.sub oid_str 0 8;
-        String.Table.set current_table sym o;
-      end
+      debug "[O] %s %s := %s" sym side_str @@ String.sub oid_str 0 8;
+      String.Table.set current_table sym o;
     end
   in
   let on_delete o =
@@ -266,10 +265,7 @@ let on_order action data =
       String.Table.remove current_table sym;
   in
   begin match action with
-  | Partial -> don't_wait_for begin
-      Ivar.read instruments_initialized >>| fun () ->
-      List.iter data ~f:on_partial
-    end
+  | Partial -> List.iter data ~f:on_partial
   | Insert | Update -> List.iter data ~f:(on_insert_update action)
   | Delete -> List.iter data ~f:on_delete
   end
@@ -286,9 +282,7 @@ let on_position action data =
     in
     String.Table.set positions sym p;
     Monitor.try_with ~name:"on_position_update"
-      (fun () ->
-         feed_initialized >>= fun () ->
-         on_position_update action sym oldp p) >>| function
+      (fun () -> on_position_update action sym oldp p) >>| function
     | Ok () -> ()
     | Error exn -> match Monitor.extract_exn exn with
     | Failure reason -> info "[P] %s" reason
@@ -304,7 +298,16 @@ let on_position action data =
   in
   match action with
   | Delete -> List.iter data ~f:on_delete; Deferred.unit
-  | _ -> Deferred.List.iter data ~how:`Sequential ~f:(on_not_delete action)
+  | _ ->
+    if Deferred.is_determined feed_initialized then
+      Deferred.List.iter data ~how:`Sequential ~f:(on_not_delete action)
+    else begin
+      don't_wait_for begin
+        feed_initialized >>= fun () ->
+        Deferred.List.iter data ~how:`Sequential ~f:(on_not_delete action)
+      end;
+      Deferred.unit
+    end
 
 let on_orderbook action data =
   (* debug "<- %s" (Yojson.Safe.to_string (`List data)); *)
@@ -370,8 +373,8 @@ let on_orderbook action data =
     String.Table.set vwaps ~key:h.symbol ~data:(OB.create_vwap ~max_pos_p ~total_v ());
     if total_v > 0 then
       let { divisor } = String.Table.find_exn ticksizes h.symbol in
-      info "[OB] %s %s %d %d"
-        h.symbol (Side.show side)
+      info "[OB] %s %s %s %d %d"
+        (show_update_action action) h.symbol (Side.show side)
         (Option.value_map (best_elt_f new_book) ~default:0 ~f:(fun (v, _) -> v / divisor))
         (max_pos_p / total_v / divisor);
 
@@ -385,10 +388,7 @@ let on_orderbook action data =
 
   | _ -> ()
   in
-  don't_wait_for begin
-    Ivar.read instruments_initialized >>| fun () ->
-    List.iter data ~f:iter_f
-  end
+  List.iter data ~f:iter_f
 
 let market_make buf strategy instruments =
   let on_ws_msg msg_str =
@@ -400,15 +400,27 @@ let market_make buf strategy instruments =
           error "%s" msg_str
         | `Ok response ->
           info "%s" @@ Ws.show_response response
-      end
+      end; Deferred.unit
     | `Ok { table; action; data } ->
       let action = update_action_of_string action in
       match table with
-      | "instrument" -> on_instrument action data
-      | "orderBookL2" -> on_orderbook action data
-      | "order" -> on_order action data
-      | "position" -> don't_wait_for @@ on_position action data
-      | _ -> error "Invalid table %s" table
+      | "instrument" -> on_instrument action data; Deferred.unit
+      | "orderBookL2" ->
+        if Ivar.is_full instruments_initialized then on_orderbook action data
+        else don't_wait_for begin
+            Ivar.read instruments_initialized >>| fun () ->
+            on_orderbook action data
+          end;
+        Deferred.unit
+      | "order" ->
+        if Ivar.is_full instruments_initialized then on_order action data
+        else don't_wait_for begin
+            Ivar.read instruments_initialized >>| fun () ->
+            on_order action data
+          end;
+        Deferred.unit
+      | "position" -> on_position action data
+      | _ -> error "Invalid table %s" table; Deferred.unit
   in
   (* Cancel all orders *)
   Order.cancel_all !order_cfg >>= function
@@ -423,7 +435,7 @@ let market_make buf strategy instruments =
     don't_wait_for (Ivar.read instruments_initialized >>= fun () -> S.update_orders strategy);
     let ws = Ws.open_connection ~log:log_ws ~testnet:!testnet ~auth:(!api_key, !api_secret) ~topics () in
     Monitor.handle_errors
-      (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
+      (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
       (fun exn -> error "%s" @@ Exn.to_string exn)
 
 let rpc_client port =

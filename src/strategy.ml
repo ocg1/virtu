@@ -30,12 +30,6 @@ module Common (C : Cfg) = struct
     RespObj.bool o "workingIndicator" >>= fun working ->
     if leavesQty > 0L && working then Some o else None
 
-  let price_qty_of_order o =
-    let open Option.Monad_infix in
-    RespObj.float o "price" >>= fun price ->
-    RespObj.int64 o "leavesQty" >>| fun leavesQty ->
-    satoshis_int_of_float_exn price, Int64.to_int_exn leavesQty
-
   let update_orders_price symbol side dprice tickSize =
     let mk_order o =
       let orig, oid = Order.oid_of_respobj o in
