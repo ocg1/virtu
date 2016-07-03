@@ -157,8 +157,7 @@ let exponent_divisor_of_tickSize tickSize =
   exponent, Int.(pow 10 (8 + exponent))
 
 let float_of_satoshis symbol { multiplier; mult_exponent; divisor } price =
-  let res = Printf.sprintf "%.*f" (Int.neg mult_exponent) (Float.of_int (price / divisor) *. multiplier) in
-  Float.of_string res
+  Printf.sprintf "%.*f" (Int.neg mult_exponent) (Float.of_int (price / divisor) *. multiplier) |> Float.of_string
 
 let mk_new_market_order ~symbol ~qty : Yojson.Safe.json =
   `Assoc [
@@ -177,11 +176,11 @@ let mk_new_limit_order ~symbol ~ticksize ~side ~price ~qty uuid_str =
     "execInst", `String "ParticipateDoNotInitiate"
   ]
 
-let mk_amended_limit_order ?price ?qty ~symbol ~ticksize orderID =
+let mk_amended_limit_order ?price ?qty ~symbol ~ticksize orig oid =
   `Assoc (List.filter_opt [
-    Some ("orderID", `String orderID);
-    Option.map qty ~f:(fun qty -> "leavesQty", `Int qty);
-    Option.map price ~f:(fun price -> "price", `Float (float_of_satoshis symbol ticksize price));
+      Some ((match orig with `S -> "orderID" | `C -> "clOrdID"), `String oid);
+      Option.map qty ~f:(fun qty -> "leavesQty", `Int qty);
+      Option.map price ~f:(fun price -> "price", `Float (float_of_satoshis symbol ticksize price));
     ])
 
 let to_remote_sym = function

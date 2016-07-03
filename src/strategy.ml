@@ -38,13 +38,13 @@ module Common (C : Cfg) = struct
 
   let update_orders_price symbol side dprice tickSize =
     let mk_order o =
-      let oid = RespObj.string_exn o "orderID" in
+      let orig, oid = Order.oid_of_respobj o in
       let old_price = satoshis_int_of_float_exn @@ RespObj.float_exn o "price" in
       let new_price = match dprice with `Abs p -> p | `Diff dp -> old_price + dp in
       if old_price = new_price then None else begin
         Log.info log "update order price %s %s %s %d -> %d" symbol (Side.show side) (String.sub oid 0 8) (old_price / tickSize) (new_price / tickSize);
         let ticksize = String.Table.find_exn ticksizes symbol in
-        Option.some @@ mk_amended_limit_order ~symbol ~ticksize ~price:new_price oid
+        Option.some @@ mk_amended_limit_order ~symbol ~ticksize ~price:new_price orig oid
       end
     in
     Option.Monad_infix.(current_working_order symbol side >>= mk_order)

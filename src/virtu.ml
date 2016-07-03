@@ -106,7 +106,6 @@ module S = Strategy.Blanket(struct
     let quoted_instruments = quoted_instruments
     let ticksizes = ticksizes
     let local_best_price = OB.best_price
-    let local_mid_price = OB.mid_price
   end)
 
 let dead_man's_switch timeout period =
@@ -119,7 +118,6 @@ let dead_man's_switch timeout period =
   in loop ()
 
 let compute_orders symbol side price order newQty =
-  let orderID = Option.map order ~f:(fun o -> RespObj.string_exn o "orderID") in
   let leavesQty = Option.map order ~f:(fun o -> RespObj.int64_exn o "leavesQty" |> Int64.to_int_exn) in
   let ticksize = String.Table.find_exn ticksizes symbol in
   let leavesQtySexp = Option.sexp_of_t Int.sexp_of_t leavesQty |> Sexp.to_string_hum in
@@ -129,10 +127,9 @@ let compute_orders symbol side price order newQty =
     let clOrdID = Uuid.(create () |> to_string) in
     Option.some (clOrdID, mk_new_limit_order ~symbol ~side ~ticksize ~price ~qty:newQty clOrdID), None
   | Some _ ->
-    let orderID = Option.(value_exn orderID) in
-    None, Option.some (orderID, mk_amended_limit_order ~symbol ~ticksize ~price ~qty:newQty orderID)
+    let orig, oid = Order.oid_of_respobj (Option.value_exn order) in
+    None, Option.some (oid, mk_amended_limit_order ~symbol ~ticksize ~qty:newQty orig oid)
   | _ -> None, None
-
 
 let string_of_order = function
 | None -> "()"
@@ -160,12 +157,12 @@ let on_position_update action symbol oldp p =
   let bestAsk = OB.best_price Ask symbol in
   let bestBid = Option.value_map bestBid ~default:0 ~f:fst in
   let bestAsk = Option.value_map bestAsk ~default:0 ~f:fst in
-  let currentBidQty = Option.value ~default:0 (RespObj.int64 p "openOrderBuyQty" |> Option.map ~f:Int64.to_int_exn) in
-  let currentAskQty = Option.value ~default:0 (RespObj.int64 p "openOrderSellQty" |> Option.map ~f:Int64.to_int_exn) in
+  let currentBidQty = Option.value_map (RespObj.int64 p "openOrderBuyQty") ~default:0 ~f:Int64.to_int_exn in
+  let currentAskQty = Option.value_map (RespObj.int64 p "openOrderSellQty") ~default:0 ~f:Int64.to_int_exn in
   let newBidQty = Int.max (max_pos_size - currentQty) 0 in
   let newAskQty = Int.max (max_pos_size + currentQty) 0 in
   if currentBidQty = newBidQty && currentAskQty = newAskQty then failwithf "position unchanged" ();
-  info "target position: bid %d -> %d, ask %d -> %d" currentBidQty newBidQty currentAskQty newAskQty;
+  info "orders needed: bid %d -> %d, ask %d -> %d" currentBidQty newBidQty currentAskQty newAskQty;
   info "current orders: %s %s" (string_of_order currentBid) (string_of_order currentAsk);
   let currentBid = Option.bind currentBid (fun o -> if is_in_flight o then None else Some o) in
   let currentAsk = Option.bind currentAsk (fun o -> if is_in_flight o then None else Some o) in
@@ -230,8 +227,8 @@ let on_order action data =
     Uuid.(Table.set orders (of_string oid_str) o);
     String.Table.set current_table sym o
   in
-  let on_insert_update action o =
-    let o = RespObj.of_json o in
+  let on_insert_update action o_json =
+    let o = RespObj.of_json o_json in
     let sym = RespObj.string_exn o "symbol" in
     let ordOrig, oid_str = Order.oid_of_respobj o in
     let oid = Uuid.of_string oid_str in
@@ -243,8 +240,10 @@ let on_order action data =
     let side = buy_sell_of_bmex side_str in
     let current_table = match side with `Buy -> current_bids | `Sell -> current_asks in
     if ordOrig = `C then begin
-      if not workingIndicator then
+      if not workingIndicator then begin
+        debug "[O] Removing %s" @@ Yojson.Safe.to_string o_json;
         String.Table.remove current_table sym
+      end
       else begin
         debug "[O] %s %s := %s" sym side_str @@ String.sub oid_str 0 8;
         String.Table.set current_table sym o;
