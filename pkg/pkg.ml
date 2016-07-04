@@ -8,4 +8,5 @@ let () =
   Ok [
     Pkg.bin "src/hedger";
     Pkg.bin "src/virtu";
+    Pkg.bin "src/sim";
   ]
