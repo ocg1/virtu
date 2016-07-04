@@ -430,7 +430,7 @@ let market_make buf strategy instruments =
     failwith err_str
   | Ok _ ->
     info "all orders canceled";
-    let topics = "instrument" :: "order" :: "position" :: List.map instruments ~f:(fun i -> "orderBookL2:" ^ i) in
+    let topics = "order" :: "position" :: List.(map instruments ~f:(fun i -> ["instrument:" ^ i; "orderBookL2:" ^ i]) |> concat) in
     don't_wait_for @@ dead_man's_switch 60000 15;
     don't_wait_for (Ivar.read instruments_initialized >>= fun () -> S.update_orders strategy);
     let ws = Ws.open_connection ~log:log_ws ~testnet:!testnet ~auth:(!api_key, !api_secret) ~topics () in
