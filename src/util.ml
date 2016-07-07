@@ -4,16 +4,6 @@ open Async.Std
 open Bs_devkit.Core
 open Bs_api.BMEX
 
-module Cfg = struct
-  type cfg = {
-    key: string;
-    secret: string;
-    quote: (string * int) list [@default []];
-  } [@@deriving yojson]
-
-  type t = (string * cfg) list [@@deriving yojson]
-end
-
 module Order = struct
   type cfg = {
     dry_run: bool [@default false];
