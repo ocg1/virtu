@@ -55,7 +55,7 @@ let on_instrument action data =
   | Partial | Insert ->
     List.iter data ~f:on_partial_insert;
     Ivar.fill_if_empty instruments_initialized ()
-  | Update -> List.iter data ~f:on_update
+  | Update -> if Ivar.is_full instruments_initialized then List.iter data ~f:on_update
   | _ -> error "instrument: got action %s" (show_update_action action)
   end
 
@@ -104,8 +104,9 @@ let on_trade datafile action data =
   in
   match action with
   | Insert ->
-    Out_channel.with_file datafile ~binary:false ~append:true
-      ~f:(fun oc -> List.iter data ~f:(iter_f oc))
+    if Ivar.is_full instruments_initialized then
+      Out_channel.with_file datafile ~binary:false ~append:true
+        ~f:(fun oc -> List.iter data ~f:(iter_f oc))
   | _ -> ()
 
 let simulate datafile buf instruments =
