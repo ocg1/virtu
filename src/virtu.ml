@@ -125,10 +125,10 @@ let compute_orders ?order symbol side price newQty =
   match leavesQty with
   | None when newQty > 0 ->
     let clOrdID = Uuid.(create () |> to_string) in
-    Option.some (clOrdID, mk_new_limit_order ~symbol ~side ~ticksize ~price ~qty:newQty clOrdID), None
-  | Some _ ->
+    Some (clOrdID, mk_new_limit_order ~symbol ~side ~ticksize ~price ~qty:newQty clOrdID), None
+  | Some leavesQty when leavesQty > 0 || leavesQty = 0 && newQty > 0 ->
     let orig, oid = Order.oid_of_respobj (Option.value_exn order) in
-    None, Option.some (oid, mk_amended_limit_order ~symbol ~ticksize ~price ~qty:newQty orig oid)
+    None, Some (oid, mk_amended_limit_order ~symbol ~ticksize ~price ~qty:newQty orig oid)
   | _ -> None, None
 
 let string_of_order = function
