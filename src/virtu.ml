@@ -174,24 +174,17 @@ let on_position_update action symbol oldp p =
   in
   let bidSubmit, bidAmend = compute_orders ?order:currentBid symbol Bid bidPrice newBidQty in
   let askSubmit, askAmend = compute_orders ?order:currentAsk symbol Ask askPrice newAskQty in
-  let submit_th = match
-    List.fold_left [bidSubmit; askSubmit] ~init:[]
+  let make_th f orders = match
+    List.fold_left orders ~init:[]
       ~f:(fun a -> function None -> a | Some (_, o) -> o :: a)
   with
   | [] -> Deferred.unit
-  | orders -> Order.submit !order_cfg orders >>| function
+  | orders -> f !order_cfg orders >>| function
     | Ok _ -> ()
     | Error err -> error "on_position_update: %s: %s" (Yojson.Safe.to_string (`List orders)) (Error.to_string_hum err)
   in
-  let amend_th = match
-    List.fold_left [bidAmend; askAmend] ~init:[]
-      ~f:(fun a -> function None -> a | Some (_, o) -> o :: a)
-  with
-  | [] -> Deferred.unit
-  | orders -> Order.update !order_cfg orders >>| function
-    | Ok _ -> ()
-    | Error err -> error "on_position_update: %s: %s" (Yojson.Safe.to_string (`List orders)) (Error.to_string_hum err)
-  in
+  let submit_th = make_th Order.submit [bidSubmit; askSubmit] in
+  let amend_th = make_th Order.update [bidAmend; askAmend] in
   Deferred.all_unit [submit_th; amend_th]
 
 let on_instrument action data =
