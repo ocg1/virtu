@@ -143,6 +143,7 @@ let on_position_update action symbol oldp p =
   let { max_pos_size } = String.Table.find_exn quoted_instruments symbol in
   let oldQty = Option.value_map oldp ~default:0 ~f:(fun oldp -> RespObj.int64_exn oldp "currentQty" |> Int64.to_int_exn) in
   let currentQty = RespObj.int64_exn p "currentQty" |> Int64.to_int_exn in
+  if oldQty = currentQty then failwith "position unchanged";
   debug "[P] %s %s %d -> %d" (show_update_action action) symbol oldQty currentQty;
   let currentBid = String.Table.find current_bids symbol in
   let currentAsk = String.Table.find current_asks symbol in
