@@ -241,7 +241,12 @@ let on_order action data =
     let o = match Uuid.Table.find orders oid with None -> o | Some old_o -> RespObj.merge old_o o in
     Uuid.Table.set orders oid o;
     let side_str = RespObj.string_exn o "side" in
-    debug "[O] %s %s %s %s" (show_update_action action) sym side_str (String.sub oid_str 0 8);
+    let orderQty = RespObj.int64_exn o "orderQty" in
+    let leavesQty = RespObj.int64_exn o "leavesQty" in
+    let cumQty = RespObj.int64_exn o "cumQty" in
+    debug "[O] %s %s %s %s o=%Ld l=%Ld c=%Ld"
+      (show_update_action action) sym side_str (String.sub oid_str 0 8)
+      orderQty leavesQty cumQty;
     let side = buy_sell_of_bmex side_str in
     let current_table = match side with `Buy -> current_bids | `Sell -> current_asks in
     if ordOrig = `C then begin
@@ -485,10 +490,10 @@ let rpc_client port =
         Clock_ns.after @@ Time_ns.Span.of_int_sec 5 >>= loop
   in loop ()
 
-let tickers_of_instrument = function
+let tickers_of_instrument ?log = function
 | "XBTUSD" ->
   Pipe.map (Ws.Kaiko.tickers ()) ~f:(fun { index={ bid; ask } } ->
-      debug "[T] Kaiko %s %s" bid ask;
+      maybe_debug log "[T] Kaiko %s %s" bid ask;
       satoshis_int_of_float_exn @@ Float.of_string bid,
       satoshis_int_of_float_exn @@ Float.of_string ask
     )
@@ -499,7 +504,7 @@ let tickers_of_instrument = function
       let { Ws.symbol; bid; ask } = Ws.ticker_of_json @@ `List event.args in
       if symbol <> to_remote_sym "ETHXBT" then None
       else begin
-        debug "[T] PLNX %s %f %f" symbol bid ask;
+        maybe_debug log "[T] PLNX %s %f %f" symbol bid ask;
         Some (satoshis_int_of_float_exn bid, satoshis_int_of_float_exn ask)
       end
     )
