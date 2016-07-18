@@ -148,8 +148,8 @@ let on_position_update action symbol oldp p =
   let currentBid = String.Table.find current_bids symbol in
   let currentAsk = String.Table.find current_asks symbol in
   begin match currentBid, currentAsk with
-  | Some o, _
-  | _, Some o when is_in_flight o -> failwithf "%s in flight" (RespObj.string_exn o "clOrdID") ()
+  | Some o, _ | _, Some o ->
+    if is_in_flight o then failwithf "%s in flight" (RespObj.string_exn o "clOrdID") ()
   | _ -> ()
   end;
   (* let fw_p_to_hedger c = Rpc.Rpc.dispatch Protocols.Position.t c (symbol, currentQty) in *)
@@ -311,10 +311,9 @@ let on_position action data =
 let on_orderbook action data =
   (* debug "<- %s" (Yojson.Safe.to_string (`List data)); *)
   let action_str = show_update_action action in
-  let of_json json =
-    match OrderBook.L2.of_yojson json with
-    | `Ok u -> u
-    | `Error reason -> failwithf "%s: %s (%s)" reason Yojson.Safe.(to_string json) action_str ()
+  let of_json json = match OrderBook.L2.of_yojson json with
+  | Ok u -> u
+  | Error reason -> failwithf "%s: %s (%s)" reason Yojson.Safe.(to_string json) action_str ()
   in
   let update_depth action old_book { OrderBook.L2.symbol; id; side = side_str; price = new_price; size = new_qty } =
     let orders = String.Table.find_exn OB.orders symbol in
@@ -393,14 +392,14 @@ let market_make buf strategy instruments =
   let on_ws_msg msg_str =
     let msg_json = Yojson.Safe.from_string ~buf msg_str in
     match Ws.update_of_yojson msg_json with
-    | `Error _ -> begin
+    | Error _ -> begin
         match Ws.response_of_yojson msg_json with
-        | `Error _ ->
+        | Error _ ->
           error "%s" msg_str
-        | `Ok response ->
+        | Ok response ->
           info "%s" @@ Ws.show_response response
       end; Deferred.unit
-    | `Ok { table; action; data } ->
+    | Ok { table; action; data } ->
       let action = update_action_of_string action in
       match table with
       | "instrument" -> on_instrument action data; Deferred.unit
@@ -507,7 +506,7 @@ let tickers_of_instrument ?log = function
 let main cfg port daemon pidfile logfile loglevel wsllevel main dry fixed remfixed instruments () =
   don't_wait_for begin
     Lock_file.create_exn pidfile >>= fun () ->
-    let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> presult_exn in
+    let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> Result.ok_or_failwith in
     let { Cfg.key; secret; quote } = List.Assoc.find_exn cfg (if main then "BMEX" else "BMEXT") in
     let secret_cstruct = Cstruct.of_string secret in
     testnet := not main;

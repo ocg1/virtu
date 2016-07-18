@@ -63,7 +63,7 @@ let on_quote action data =
   let iter_f q_json =
     (* debug "%s %s" (show_update_action action) @@ Yojson.Safe.to_string (`List data); *)
     Quote.of_yojson q_json |>
-    presult_exn |> fun q ->
+    Result.ok_or_failwith |> fun q ->
     String.Table.set quotes q.Quote.symbol
       (create_quote
          ~timestamp:(Time_ns.of_string q.Quote.timestamp)
@@ -78,7 +78,7 @@ let on_trade datafile action data =
   let iter_f oc t_json =
     debug "%s %s" (show_update_action action) @@ Yojson.Safe.to_string (`List data);
     Trade.of_yojson t_json |>
-    presult_exn |> fun t ->
+    Result.ok_or_failwith |> fun t ->
     let { divisor = tickSize } = String.Table.find_exn ticksizes t.symbol in
     let max_pos_size = String.Table.find_exn quoted_instruments t.symbol in
     let cur_pos = String.Table.find_exn positions t.symbol in
@@ -113,14 +113,14 @@ let simulate datafile buf instruments =
   let on_ws_msg msg_str =
     let msg_json = Yojson.Safe.from_string ~buf msg_str in
     match Ws.update_of_yojson msg_json with
-    | `Error _ -> begin
+    | Error _ -> begin
         match Ws.response_of_yojson msg_json with
-        | `Error _ ->
+        | Error _ ->
           error "%s" msg_str
-        | `Ok response ->
+        | Ok response ->
           info "%s" @@ Ws.show_response response
       end; Deferred.unit
-    | `Ok { table; action; data } ->
+    | Ok { table; action; data } ->
       let action = update_action_of_string action in
       match table with
       | "instrument" -> on_instrument action data; Deferred.unit
@@ -142,7 +142,7 @@ let main cfg daemon rundir logdir loglevel test instruments () =
   don't_wait_for begin
     Lock_file.create_exn pidfile >>= fun () ->
     testnet := test;
-    let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> presult_exn in
+    let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> Result.ok_or_failwith in
     let { Cfg.quote } = List.Assoc.find_exn cfg (if test then "BMEXT" else "BMEX") in
     let instruments = if instruments = [] then quote else instruments in
     let buf = Bi_outbuf.create 4096 in

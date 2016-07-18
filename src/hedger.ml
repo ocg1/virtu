@@ -260,7 +260,7 @@ let rpc_server port =
 let main cfg port daemon pidfile logfile loglevel instruments () =
   don't_wait_for begin
     Lock_file.create_exn pidfile >>= fun () ->
-    let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> presult_exn in
+    let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> Result.ok_or_failwith in
     let { Cfg.key; secret } = List.Assoc.find_exn cfg "BFX" in
     bfx_key := key;
     bfx_secret := Cstruct.of_string secret;
