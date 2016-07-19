@@ -310,11 +310,7 @@ let on_position action data =
 
 let on_orderbook action data =
   (* debug "<- %s" (Yojson.Safe.to_string (`List data)); *)
-  let action_str = show_update_action action in
-  let of_json json = match OrderBook.L2.of_yojson json with
-  | Ok u -> u
-  | Error reason -> failwithf "%s: %s (%s)" reason Yojson.Safe.(to_string json) action_str ()
-  in
+  let action_str = sexp_of_update_action action |> Sexp.to_string in
   let update_depth action old_book { OrderBook.L2.symbol; id; side = side_str; price = new_price; size = new_qty } =
     let orders = String.Table.find_exn OB.orders symbol in
     let old_order = Int.Table.find orders id in
@@ -351,11 +347,11 @@ let on_orderbook action data =
         (Option.value ~default:Int.max_value new_price)
         (Option.value ~default:Int.max_value new_qty) ()
   in
-  let data = List.map data ~f:of_json in
+  let data = List.map data ~f:(Fn.compose Result.ok_or_failwith OrderBook.L2.of_yojson) in
   let data = List.group data ~break:(fun u u' -> u.OrderBook.L2.symbol <> u'.symbol || u.side <> u'.side) in
   let iter_f = function
   | (h :: t) as us when String.Table.mem quoted_instruments h.OrderBook.L2.symbol ->
-    let side, best_elt_f, books, vwaps = match buy_sell_of_bmex h.OrderBook.L2.side with
+    let side, best_elt_f, books, vwaps = match buy_sell_of_bmex h.side with
     | `Buy -> Side.Bid, Int.Map.max_elt, OB.bids, OB.bid_vwaps
     | `Sell -> Ask, Int.Map.min_elt, OB.asks, OB.ask_vwaps
     in
