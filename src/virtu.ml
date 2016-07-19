@@ -144,7 +144,7 @@ let on_position_update action symbol oldp p =
   let oldQty = Option.value_map oldp ~default:0 ~f:(fun oldp -> RespObj.int64_exn oldp "currentQty" |> Int64.to_int_exn) in
   let currentQty = RespObj.int64_exn p "currentQty" |> Int64.to_int_exn in
   if oldQty = currentQty then failwith "position unchanged";
-  debug "[P] %s %s %d -> %d" (show_update_action action) symbol oldQty currentQty;
+  debug "[P] %s %s %d -> %d" (sexp_of_update_action action |> Sexp.to_string) symbol oldQty currentQty;
   let currentBid = String.Table.find current_bids symbol in
   let currentAsk = String.Table.find current_asks symbol in
   begin match currentBid, currentAsk with
@@ -212,7 +212,7 @@ let on_instrument action data =
     List.iter data ~f:on_partial_insert;
     Ivar.fill_if_empty instruments_initialized ()
   | Update -> List.iter data ~f:on_update
-  | _ -> error "instrument: got action %s" (show_update_action action)
+  | _ -> error "instrument: got action %s" (sexp_of_update_action action |> Sexp.to_string)
   end
 
 let on_order action data =
@@ -223,7 +223,7 @@ let on_order action data =
     let side = buy_sell_of_bmex side_str in
     let current_table = match side with `Buy -> current_bids | `Sell -> current_asks in
     let ordOrig, oid_str = Order.oid_of_respobj o in
-    debug "[O] %s %s %s %s" (show_update_action action) sym side_str (String.sub oid_str 0 8);
+    debug "[O] %s %s %s %s" (sexp_of_update_action action |> Sexp.to_string) sym side_str (String.sub oid_str 0 8);
     Uuid.(Table.set orders (of_string oid_str) o);
     String.Table.set current_table sym o
   in
@@ -239,7 +239,7 @@ let on_order action data =
     let leavesQty = RespObj.int64_exn o "leavesQty" in
     let cumQty = RespObj.int64_exn o "cumQty" in
     debug "[O] %s %s %s %s o=%Ld l=%Ld c=%Ld"
-      (show_update_action action) sym side_str (String.sub oid_str 0 8)
+      (sexp_of_update_action action |> Sexp.to_string) sym side_str (String.sub oid_str 0 8)
       orderQty leavesQty cumQty;
     let side = buy_sell_of_bmex side_str in
     let current_table = match side with `Buy -> current_bids | `Sell -> current_asks in
@@ -259,7 +259,7 @@ let on_order action data =
       let side_str = RespObj.string_exn o "side" in
       let side = buy_sell_of_bmex side_str in
       let current_table = match side with `Buy -> current_bids | `Sell -> current_asks in
-      debug "[O] %s %s %s" (show_update_action action) side_str (String.sub oid_str 0 8);
+      debug "[O] %s %s %s" (sexp_of_update_action action |> Sexp.to_string) side_str (String.sub oid_str 0 8);
       Uuid.Table.remove orders oid;
       String.Table.remove current_table sym;
   in
@@ -291,7 +291,7 @@ let on_position action data =
     let p = RespObj.of_json p in
     let sym = RespObj.string_exn p "symbol" in
     if String.Table.mem quoted_instruments sym then begin
-      debug "[P] %s %s" (show_update_action action) sym;
+      debug "[P] %s %s" (sexp_of_update_action action |> Sexp.to_string) sym;
       String.Table.remove positions sym
     end
   in
@@ -368,7 +368,7 @@ let on_orderbook action data =
     if total_v > 0 then
       let { divisor } = String.Table.find_exn ticksizes h.symbol in
       info "[OB] %s %s %s %d %d"
-        (show_update_action action) h.symbol (Side.show side)
+        (sexp_of_update_action action |> Sexp.to_string) h.symbol (Side.show side)
         (Option.value_map (best_elt_f new_book) ~default:0 ~f:(fun (v, _) -> v / divisor))
         (max_pos_p / total_v / divisor);
 
