@@ -9,4 +9,5 @@ let () =
     Pkg.bin "src/hedger";
     Pkg.bin "src/virtu";
     Pkg.bin "src/sim";
+    Pkg.bin "src/logobs";
   ]
