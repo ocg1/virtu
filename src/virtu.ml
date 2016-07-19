@@ -121,7 +121,7 @@ let compute_orders ?order symbol side price newQty =
   let leavesQty = Option.map order ~f:(fun o -> RespObj.int64_exn o "leavesQty" |> Int64.to_int_exn) in
   let ticksize = String.Table.find_exn ticksizes symbol in
   let leavesQtySexp = Option.sexp_of_t Int.sexp_of_t leavesQty |> Sexp.to_string_hum in
-  debug "compute_orders %s %s %d %s %d" symbol (Side.show side) (price / ticksize.divisor) leavesQtySexp newQty;
+  debug "compute_orders %s %s %d %s %d" symbol (Side.sexp_of_t side |> Sexp.to_string) (price / ticksize.divisor) leavesQtySexp newQty;
   match leavesQty with
   | None when newQty > 0 ->
     let clOrdID = Uuid.(create () |> to_string) in
@@ -368,12 +368,12 @@ let on_orderbook action data =
     if total_v > 0 then
       let { divisor } = String.Table.find_exn ticksizes h.symbol in
       info "[OB] %s %s %s %d %d"
-        (sexp_of_update_action action |> Sexp.to_string) h.symbol (Side.show side)
+        (sexp_of_update_action action |> Sexp.to_string) h.symbol (Side.sexp_of_t side |> Sexp.to_string)
         (Option.value_map (best_elt_f new_book) ~default:0 ~f:(fun (v, _) -> v / divisor))
         (max_pos_p / total_v / divisor);
 
     if action = Partial then begin
-      debug "[OB] %s %s initialized" h.symbol (Side.show side);
+      debug "[OB] %s %s initialized" h.symbol (Side.sexp_of_t side |> Sexp.to_string);
       let { bids_initialized; asks_initialized } = String.Table.find_exn quoted_instruments h.symbol in
       match side with
       | Bid -> Ivar.fill_if_empty bids_initialized ()

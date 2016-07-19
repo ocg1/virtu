@@ -72,7 +72,7 @@ let compute_vwaps sym side vwaps old_book new_book =
   let new_best_elt = Option.map ~f:fst @@ best_elt_f new_book in
   begin match old_best_elt, new_best_elt, old_vwap with
   | Some old_best, Some new_best, Some (old_vwap, _) when old_best <> new_best || old_vwap <> new_vwap ->
-    if old_best <> new_best then Log.debug log_bfx "-> tickup %s %s %d %d" sym (Side.show side) (new_best / 1_000_000) (new_vwap / 1_000_000);
+    if old_best <> new_best then Log.debug log_bfx "-> tickup %s %s %d %d" sym (Side.sexp_of_t side |> Sexp.to_string) (new_best / 1_000_000) (new_vwap / 1_000_000);
     Option.iter !tickups_w ~f:(fun p ->
         (try
           Pipe.write_without_pushback p @@
