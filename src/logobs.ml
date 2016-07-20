@@ -40,7 +40,7 @@ let make_on_orderbook () =
       let endp = bin_write_update value ~pos:0 update in
       let data = Bigstring.To_string.sub value 0 endp in
       let db = String.Table.find_exn bmex_dbs u.symbol in
-      LevelDB.put ~sync:true db key data
+      LevelDB.put db key data
     in
     List.iter data ~f:(fun g ->
         let now_sec = Time_ns.to_int_ns_since_epoch now in
@@ -86,12 +86,10 @@ let logobs daemon rundir logdir datadir loglevel instruments () =
   let logfile = Filename.concat logdir @@ executable_name ^ ".log" in
   if daemon then Daemon.daemonize ~cd:"." ();
   Signal.(handle terminating ~f:(fun _ ->
-      let open Core.Std in
-      Printf.eprintf "OB logger stopping.\n";
+      info "OB logger stopping.";
       String.Table.iter bmex_dbs ~f:LevelDB.close;
-      Printf.eprintf "Saved %d dbs.\n" @@ String.Table.length bmex_dbs;
-      exit 0
-    )
+      info "Saved %d dbs." @@ String.Table.length bmex_dbs;
+      don't_wait_for @@ Shutdown.exit 0)
     );
   don't_wait_for begin
     Lock_file.create_exn pidfile >>= fun () ->
