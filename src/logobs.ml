@@ -84,14 +84,15 @@ let logobs daemon rundir logdir datadir loglevel instruments () =
   let executable_name = Sys.executable_name |> Filename.basename |> String.split ~on:'.' |> List.hd_exn in
   let pidfile = Filename.concat rundir @@ executable_name ^ ".pid" in
   let logfile = Filename.concat logdir @@ executable_name ^ ".log" in
+  if daemon then Daemon.daemonize ~cd:"." ();
   Signal.(handle terminating ~f:(fun _ ->
-      info "OB logger stopping";
+      let open Core.Std in
+      Printf.eprintf "OB logger stopping.\n";
       String.Table.iter bmex_dbs ~f:LevelDB.close;
-      info "Saved %d dbs" @@ String.Table.length bmex_dbs;
-      Core.Std.exit 0
+      Printf.eprintf "Saved %d dbs.\n" @@ String.Table.length bmex_dbs;
+      exit 0
     )
     );
-  if daemon then Daemon.daemonize ~cd:"." ();
   don't_wait_for begin
     Lock_file.create_exn pidfile >>= fun () ->
     let log_outputs filename = Log.Output.[stderr (); file `Text ~filename] in
@@ -127,6 +128,7 @@ let logobs =
   Command.basic ~summary:"Log exchanges order books" spec logobs
 
 let show tail max_ticks dbpath () =
+  let open Core.Std in
   let nb_read = ref 0 in
   let iter_f = if tail then LevelDB.rev_iter else LevelDB.iter in
   let db = LevelDB.open_db dbpath in
@@ -138,7 +140,7 @@ let show tail max_ticks dbpath () =
         in
         let pos_ref = ref 0 in
         let update = bin_read_update ~pos_ref @@ Bigstring.of_string data in
-        Format.(fprintf std_formatter "%d %s %a@." !nb_read (Time_ns.to_string ts) Sexp.pp @@ sexp_of_update update);
+        Format.printf "%d %s %a@." !nb_read (Time_ns.to_string ts) Sexp.pp @@ sexp_of_update update;
         incr nb_read;
         Option.value_map max_ticks
           ~default:true ~f:(fun max_ticks -> not (!nb_read = max_ticks))
