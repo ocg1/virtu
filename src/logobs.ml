@@ -3,23 +3,12 @@ open Async.Std
 open Log.Global
 
 open Bs_devkit.Core
+open Sim_util
 
-type ob = {
-  id: int;
-  side: Side.t;
-  price: int [@default 0]; (* in satoshis *)
-  size: int [@default 0] (* in contracts or in tick size *);
-} [@@deriving create,sexp,bin_io]
-
-type update = {
-  action: Bs_api.BMEX.update_action;
-  ob: ob;
-} [@@deriving create,sexp,bin_io]
-
-let ob_of_l2 { Bs_api.BMEX.OrderBook.L2.id; side; size; price } =
+let update_of_l2 { Bs_api.BMEX.OrderBook.L2.id; side; size; price } =
   let side = match side with "Buy" -> Side.Bid | "Sell" -> Ask | _ -> invalid_arg "side_of_string" in
   let price = Option.map price ~f:satoshis_int_of_float_exn in
-  create_ob ~id ~side ?price ?size ()
+  OB.create_update ~id ~side ?price ?size ()
 
 let bmex_dbs = String.Table.create ()
 
@@ -34,10 +23,9 @@ let make_on_orderbook () =
     let data = List.group data ~break:(fun u u' -> u.OrderBook.L2.symbol <> u'.symbol) in
     let iter_f start_ts i u =
       Binary_packing.pack_signed_64_int_big_endian ~buf:key ~pos:0 @@ start_ts + i;
-      let ob = ob_of_l2 u in
-      let update = create_update ~action ~ob () in
-      debug "%s" (sexp_of_update update |> Sexp.to_string);
-      let endp = bin_write_update value ~pos:0 update in
+      let update = OB.create ~action ~data:(update_of_l2 u) () in
+      debug "%s" (OB.sexp_of_t update |> Sexp.to_string);
+      let endp = OB.bin_write_t value ~pos:0 update in
       let data = Bigstring.To_string.sub value 0 endp in
       let db = String.Table.find_exn bmex_dbs u.symbol in
       LevelDB.put db key data
@@ -136,9 +124,8 @@ let show tail max_ticks dbpath () =
         let ts = Time_ns.of_int_ns_since_epoch @@
           Binary_packing.unpack_signed_64_int_big_endian ~buf:ts ~pos:0
         in
-        let pos_ref = ref 0 in
-        let update = bin_read_update ~pos_ref @@ Bigstring.of_string data in
-        Format.printf "%d %s %a@." !nb_read (Time_ns.to_string ts) Sexp.pp @@ sexp_of_update update;
+        let update = OB.bin_read_t ~pos_ref:(ref 0) @@ Bigstring.of_string data in
+        Format.printf "%d %s %a@." !nb_read (Time_ns.to_string ts) Sexp.pp @@ OB.sexp_of_t update;
         incr nb_read;
         Option.value_map max_ticks
           ~default:true ~f:(fun max_ticks -> not (!nb_read = max_ticks))
