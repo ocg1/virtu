@@ -94,7 +94,7 @@ let on_bfx_book_update sym { BFX.Ws.Book.Raw.id; price = new_price; amount = new
       Some (bps_int_of_float_exn new_qty)
   in
   (* Log.debug log_bfx "<- %d %d %d" id (Option.value ~default:0 new_price / 1_000_000) (Option.value ~default:0 new_qty); *)
-  let action = if Option.is_none new_price then BMEX.Delete else Insert in
+  let action = if Option.is_none new_price then OB.Delete else Insert in
   let old_book = String.Table.find_exn books sym in
   let new_book = match action, new_price, new_qty, Int.Table.find orders id with
   | Delete, None, None, Some { price = oldp; qty = oldq } ->

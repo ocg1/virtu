@@ -5,7 +5,6 @@ open Log.Global
 open Dtc
 
 open Bs_devkit.Core
-open Sim_util
 
 type trade = { price: int; qty: int; side: BuyOrSell.t } [@@deriving sexp]
 
@@ -96,14 +95,15 @@ let main gnuplot max_count low high (db_ob, db_trades, ticksize, size) () =
   | OB ({ action=Delete; data={ id; side; }} as ob) ->
     if not gnuplot then Format.printf "%a %a@." Time_ns.pp ts Sexp.pp (OB.sexp_of_t ob);
     (* FIXME: Should never be deleted 2 times! *)
-    Option.iter (Int.Table.find obs id) ~f:begin fun (oldp, _) ->
+    (* Option.iter (Int.Table.find obs id) ~f:begin fun (oldp, _) -> *)
+    let oldp, _ = Int.Table.find_exn obs id in
       Int.Table.remove obs id;
       let table = match side with Bid -> bids | Ask -> asks in
       table := Int.Map.update !table oldp ~f:(function
         | None -> failwith "Inconsistent orderbook"
         | Some bs -> List.Assoc.remove bs id
-        )
-    end;
+        );
+    (* end; *)
     last_partial := false;
     | OB ({ action=Update; data={ id; side; price; size }} as ob) ->
     if not gnuplot then Format.printf "%a %a@." Time_ns.pp ts Sexp.pp (OB.sexp_of_t ob);

@@ -6,7 +6,7 @@ open Log.Global
 
 open Util
 open Bs_devkit.Core
-open Bs_api.BMEX
+open Bs_api
 
 let log_ws = Log.(create ~level:`Error ~on_error:`Raise ~output:[Output.stderr ()])
 
@@ -39,7 +39,7 @@ let ticksizes : ticksize String.Table.t = String.Table.create ()
 let current_bids : RespObj.t String.Table.t = String.Table.create ()
 let current_asks : RespObj.t String.Table.t = String.Table.create ()
 
-module OB = struct
+module OrderBook = struct
   type order = { price: int; qty: int }
   let orders : (order Int.Table.t) String.Table.t = String.Table.create ()
 
@@ -105,7 +105,7 @@ module S = Strategy.Blanket(struct
     let current_asks = current_asks
     let quoted_instruments = quoted_instruments
     let ticksizes = ticksizes
-    let local_best_price = OB.best_price
+    let local_best_price = OrderBook.best_price
   end)
 
 let dead_man's_switch timeout period =
@@ -144,7 +144,7 @@ let on_position_update action symbol oldp p =
   let oldQty = Option.value_map oldp ~default:0 ~f:(fun oldp -> RespObj.int64_exn oldp "currentQty" |> Int64.to_int_exn) in
   let currentQty = RespObj.int64_exn p "currentQty" |> Int64.to_int_exn in
   if oldQty = currentQty then failwith "position unchanged";
-  debug "[P] %s %s %d -> %d" (sexp_of_update_action action |> Sexp.to_string) symbol oldQty currentQty;
+  debug "[P] %s %s %d -> %d" (OB.sexp_of_action action |> Sexp.to_string) symbol oldQty currentQty;
   let currentBid = String.Table.find current_bids symbol in
   let currentAsk = String.Table.find current_asks symbol in
   begin match currentBid, currentAsk with
@@ -163,12 +163,12 @@ let on_position_update action symbol oldp p =
   info "current orders: %s %s" (string_of_order currentBid) (string_of_order currentAsk);
   let currentBid = Option.bind currentBid (fun o -> if is_in_flight o then None else Some o) in
   let currentAsk = Option.bind currentAsk (fun o -> if is_in_flight o then None else Some o) in
-  let bidPrice = match Option.(currentBid >>= price_qty_of_order), OB.best_price Bid symbol with
+  let bidPrice = match Option.(currentBid >>= price_qty_of_order), OrderBook.best_price Bid symbol with
   | Some (price, _qty), _ -> price
   | None, Some (price, _qty) -> price
   | _ -> failwith "No suitable bid price found"
   in
-  let askPrice = match Option.(currentAsk >>= price_qty_of_order), OB.best_price Ask symbol with
+  let askPrice = match Option.(currentAsk >>= price_qty_of_order), OrderBook.best_price Ask symbol with
   | Some (price, _qty), _ -> price
   | None, Some (price, _qty) -> price
   | _ -> failwith "No suitable ask price found"
@@ -197,9 +197,9 @@ let on_instrument action data =
       ~data:(RespObj.float_exn i "tickSize" |> fun multiplier ->
              let mult_exponent, divisor = exponent_divisor_of_tickSize multiplier in
              create_ticksize ~multiplier ~mult_exponent ~divisor ());
-    String.Table.set OB.orders sym (Int.Table.create ());
-    String.Table.set OB.bids sym (Int.Map.empty);
-    String.Table.set OB.asks sym (Int.Map.empty)
+    String.Table.set OrderBook.orders sym (Int.Table.create ());
+    String.Table.set OrderBook.bids sym (Int.Map.empty);
+    String.Table.set OrderBook.asks sym (Int.Map.empty)
   in
   let on_update i =
     let i = RespObj.of_json i in
@@ -208,11 +208,11 @@ let on_instrument action data =
     String.Table.set instruments ~key:sym ~data:(RespObj.merge oldInstr i)
   in
   begin match action with
-  | Partial | Insert ->
+  | OB.Partial | Insert ->
     List.iter data ~f:on_partial_insert;
     Ivar.fill_if_empty instruments_initialized ()
   | Update -> List.iter data ~f:on_update
-  | _ -> error "instrument: got action %s" (sexp_of_update_action action |> Sexp.to_string)
+  | _ -> error "instrument: got action %s" (OB.sexp_of_action action |> Sexp.to_string)
   end
 
 let on_order action data =
@@ -220,10 +220,10 @@ let on_order action data =
     let o = RespObj.of_json o in
     let sym = RespObj.string_exn o "symbol" in
     let side_str = RespObj.string_exn o "side" in
-    let side = buy_sell_of_bmex side_str in
+    let side = BMEX.buy_sell_of_bmex side_str in
     let current_table = match side with `Buy -> current_bids | `Sell -> current_asks in
     let ordOrig, oid_str = Order.oid_of_respobj o in
-    debug "[O] %s %s %s %s" (sexp_of_update_action action |> Sexp.to_string) sym side_str (String.sub oid_str 0 8);
+    debug "[O] %s %s %s %s" (OB.sexp_of_action action |> Sexp.to_string) sym side_str (String.sub oid_str 0 8);
     Uuid.(Table.set orders (of_string oid_str) o);
     String.Table.set current_table sym o
   in
@@ -239,9 +239,9 @@ let on_order action data =
     let leavesQty = RespObj.int64_exn o "leavesQty" in
     let cumQty = RespObj.int64_exn o "cumQty" in
     debug "[O] %s %s %s %s o=%Ld l=%Ld c=%Ld"
-      (sexp_of_update_action action |> Sexp.to_string) sym side_str (String.sub oid_str 0 8)
+      (OB.sexp_of_action action |> Sexp.to_string) sym side_str (String.sub oid_str 0 8)
       orderQty leavesQty cumQty;
-    let side = buy_sell_of_bmex side_str in
+    let side = BMEX.buy_sell_of_bmex side_str in
     let current_table = match side with `Buy -> current_bids | `Sell -> current_asks in
     if ordOrig = `C then begin
       debug "[O] %s %s := %s" sym side_str @@ String.sub oid_str 0 8;
@@ -257,9 +257,9 @@ let on_order action data =
     | None -> ()
     | Some o ->
       let side_str = RespObj.string_exn o "side" in
-      let side = buy_sell_of_bmex side_str in
+      let side = BMEX.buy_sell_of_bmex side_str in
       let current_table = match side with `Buy -> current_bids | `Sell -> current_asks in
-      debug "[O] %s %s %s" (sexp_of_update_action action |> Sexp.to_string) side_str (String.sub oid_str 0 8);
+      debug "[O] %s %s %s" (OB.sexp_of_action action |> Sexp.to_string) side_str (String.sub oid_str 0 8);
       Uuid.Table.remove orders oid;
       String.Table.remove current_table sym;
   in
@@ -291,7 +291,7 @@ let on_position action data =
     let p = RespObj.of_json p in
     let sym = RespObj.string_exn p "symbol" in
     if String.Table.mem quoted_instruments sym then begin
-      debug "[P] %s %s" (sexp_of_update_action action |> Sexp.to_string) sym;
+      debug "[P] %s %s" (OB.sexp_of_action action |> Sexp.to_string) sym;
       String.Table.remove positions sym
     end
   in
@@ -310,9 +310,9 @@ let on_position action data =
 
 let on_orderbook action data =
   (* debug "<- %s" (Yojson.Safe.to_string (`List data)); *)
-  let action_str = sexp_of_update_action action |> Sexp.to_string in
-  let update_depth action old_book { OrderBook.L2.symbol; id; side = side_str; price = new_price; size = new_qty } =
-    let orders = String.Table.find_exn OB.orders symbol in
+  let action_str = OB.sexp_of_action action |> Sexp.to_string in
+  let update_depth action old_book { BMEX.OrderBook.L2.symbol; id; side = side_str; price = new_price; size = new_qty } =
+    let orders = String.Table.find_exn OrderBook.orders symbol in
     let old_order = Int.Table.find orders id in
     let old_price = Option.map old_order ~f:(fun { price } -> price) in
     let old_qty = Option.map old_order ~f:(fun { qty } -> qty) in
@@ -325,7 +325,7 @@ let on_orderbook action data =
     | None -> old_qty
     in
     match action, old_price, old_qty, new_price, new_qty with
-    | Delete, Some oldp, Some oldq, _, _ ->
+    | OB.Delete, Some oldp, Some oldq, _, _ ->
       Int.Table.remove orders id;
       book_modify_qty old_book oldp (Int.neg oldq)
     | Partial, None, None, Some newp, Some newq
@@ -347,13 +347,13 @@ let on_orderbook action data =
         (Option.value ~default:Int.max_value new_price)
         (Option.value ~default:Int.max_value new_qty) ()
   in
-  let data = List.map data ~f:(Fn.compose Result.ok_or_failwith OrderBook.L2.of_yojson) in
-  let data = List.group data ~break:(fun u u' -> u.OrderBook.L2.symbol <> u'.symbol || u.side <> u'.side) in
+  let data = List.map data ~f:(Fn.compose Result.ok_or_failwith BMEX.OrderBook.L2.of_yojson) in
+  let data = List.group data ~break:(fun u u' -> u.BMEX.OrderBook.L2.symbol <> u'.symbol || u.side <> u'.side) in
   let iter_f = function
-  | (h :: t) as us when String.Table.mem quoted_instruments h.OrderBook.L2.symbol ->
-    let side, best_elt_f, books, vwaps = match buy_sell_of_bmex h.side with
-    | `Buy -> Side.Bid, Int.Map.max_elt, OB.bids, OB.bid_vwaps
-    | `Sell -> Ask, Int.Map.min_elt, OB.asks, OB.ask_vwaps
+  | (h :: t) as us when String.Table.mem quoted_instruments h.BMEX.OrderBook.L2.symbol ->
+    let side, best_elt_f, books, vwaps = match BMEX.buy_sell_of_bmex h.side with
+    | `Buy -> Side.Bid, Int.Map.max_elt, OrderBook.bids, OrderBook.bid_vwaps
+    | `Sell -> Ask, Int.Map.min_elt, OrderBook.asks, OrderBook.ask_vwaps
     in
     let { max_pos_size } = String.Table.find_exn quoted_instruments h.symbol in
     let old_book = if action = Partial then Int.Map.empty else
@@ -364,11 +364,11 @@ let on_orderbook action data =
 
     (* compute vwap *)
     let max_pos_p, total_v = vwap ~vlimit:max_pos_size side new_book in
-    String.Table.set vwaps ~key:h.symbol ~data:(OB.create_vwap ~max_pos_p ~total_v ());
+    String.Table.set vwaps ~key:h.symbol ~data:(OrderBook.create_vwap ~max_pos_p ~total_v ());
     if total_v > 0 then
       let { divisor } = String.Table.find_exn ticksizes h.symbol in
       info "[OB] %s %s %s %d %d"
-        (sexp_of_update_action action |> Sexp.to_string) h.symbol (Side.sexp_of_t side |> Sexp.to_string)
+        (OB.sexp_of_action action |> Sexp.to_string) h.symbol (Side.sexp_of_t side |> Sexp.to_string)
         (Option.value_map (best_elt_f new_book) ~default:0 ~f:(fun (v, _) -> v / divisor))
         (max_pos_p / total_v / divisor);
 
@@ -387,16 +387,16 @@ let on_orderbook action data =
 let market_make buf strategy instruments =
   let on_ws_msg msg_str =
     let msg_json = Yojson.Safe.from_string ~buf msg_str in
-    match Ws.update_of_yojson msg_json with
+    match BMEX.Ws.update_of_yojson msg_json with
     | Error _ -> begin
-        match Ws.response_of_yojson msg_json with
+        match BMEX.Ws.response_of_yojson msg_json with
         | Error _ ->
           error "%s" msg_str
         | Ok response ->
-          info "%s" @@ Ws.show_response response
+          info "%s" @@ BMEX.Ws.show_response response
       end; Deferred.unit
     | Ok { table; action; data } ->
-      let action = update_action_of_string action in
+      let action = BMEX.update_action_of_string action in
       match table with
       | "instrument" -> on_instrument action data; Deferred.unit
       | "orderBookL2" ->
@@ -427,61 +427,14 @@ let market_make buf strategy instruments =
     let topics = "order" :: "position" :: List.(map instruments ~f:(fun i -> ["instrument:" ^ i; "orderBookL2:" ^ i]) |> concat) in
     don't_wait_for @@ dead_man's_switch 60000 15;
     don't_wait_for (Ivar.read instruments_initialized >>= fun () -> S.update_orders strategy);
-    let ws = Ws.open_connection ~log:log_ws ~testnet:!testnet ~auth:(!api_key, !api_secret) ~topics () in
+    let ws = BMEX.Ws.open_connection ~log:log_ws ~testnet:!testnet ~auth:(!api_key, !api_secret) ~topics () in
     Monitor.handle_errors
       (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
       (fun exn -> error "%s" @@ Exn.to_string exn)
 
-let rpc_client port =
-  let open Rpc in
-  let open Protocols in
-  let on_msg = function
-  | OrderBook.Subscribed (sym, max_pos) ->
-    info "hedger subscribed to %s %d" sym max_pos;
-  | Ticker t -> ()
-  in
-  let client_f c =
-    let quoted_instrs = String.Table.to_alist quoted_instruments in
-    Deferred.List.iter quoted_instrs
-      ~f:(fun (sym, { bids_initialized; asks_initialized }) ->
-          Deferred.all_unit @@ Ivar.[read bids_initialized;
-                                     read asks_initialized]
-        )
-    >>= fun () ->
-    let quoted_instrs =
-    List.filter_map quoted_instrs ~f:(fun (sym, { max_pos_size }) ->
-        Option.map (OB.xbt_value sym)
-          ~f:(fun xbt_v -> sym, max_pos_size * xbt_v)
-        )
-    in
-    Pipe_rpc.dispatch OrderBook.t c
-      (OrderBook.Subscribe quoted_instrs) >>= function
-    | Ok (Ok (feed, meta)) ->
-      List.iter quoted_instrs ~f:(fun (sym, xbt_v) ->
-          debug "-> [RPC] subscribe %s %d" sym xbt_v
-        );
-      Pipe.iter_without_pushback feed ~f:on_msg
-    | Ok (Error err) ->
-      error "[RPC] dispatch returned error: %s" (Error.to_string_hum err);
-      Deferred.unit
-    | Error err ->
-      error "[RPC] dispatch raised: %s" Error.(to_string_hum err);
-      Deferred.unit
-  in
-  let rec loop () =
-    debug "rpc starting";
-    Connection.with_client ~host:"localhost" ~port client_f >>= function
-    | Ok () ->
-        error "rpc returned, restarting";
-        Clock_ns.after @@ Time_ns.Span.of_int_sec 5 >>= loop
-    | Error exn ->
-        error "rpc_client crashed: %s" @@ Exn.(to_string exn);
-        Clock_ns.after @@ Time_ns.Span.of_int_sec 5 >>= loop
-  in loop ()
-
 let tickers_of_instrument ?log = function
 | "XBTUSD" ->
-  Pipe.map (Ws.Kaiko.tickers ()) ~f:(fun { index={ bid; ask } } ->
+  Pipe.map (BMEX.Ws.Kaiko.tickers ()) ~f:(fun { index={ bid; ask } } ->
       maybe_debug log "[T] Kaiko %s %s" bid ask;
       satoshis_int_of_float_exn @@ Float.of_string bid,
       satoshis_int_of_float_exn @@ Float.of_string ask
@@ -533,7 +486,6 @@ let main cfg port daemon pidfile logfile loglevel wsllevel main dry fixed remfix
     | _, Some remfixed -> `FixedRemote remfixed
     in
     Deferred.(all_unit [
-        (* ignore @@ rpc_client port; *)
         market_make buf strategy @@ String.Table.keys quoted_instruments;
       ]);
   end;

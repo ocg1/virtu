@@ -3,7 +3,6 @@ open Async.Std
 open Log.Global
 
 open Bs_devkit.Core
-open Sim_util
 
 let update_of_l2 { Bs_api.BMEX.OrderBook.L2.id; side; size; price } =
   let side = match side with "Buy" -> Side.Bid | "Sell" -> Ask | _ -> invalid_arg "side_of_string" in
