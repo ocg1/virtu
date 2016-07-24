@@ -1,5 +1,5 @@
 all:
-	./build hedger.native virtu.native logobs.native pnlsim.native
+	./build poloniex.byte
 
 clean:
 	./build clean

@@ -11,4 +11,5 @@ let () =
     Pkg.bin "src/livesim";
     Pkg.bin "src/pnlsim";
     Pkg.bin "src/logobs";
+    Pkg.bin "src/poloniex";
   ]
