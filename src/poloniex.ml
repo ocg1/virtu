@@ -30,11 +30,12 @@ module DB = struct
 end
 
 let ws ~db symbol =
+  let sym_polo = polo_of_symbol symbol in
   let store = DB.make_store db in
   let on_ws_msg = function
   | Wamp.Subscribed { reqid; id } ->
     let rec loop () =
-      Monitor.try_with_or_error (fun () -> Rest.orderbook (polo_of_symbol symbol)) >>= function
+      Monitor.try_with_or_error (fun () -> Rest.orderbook sym_polo) >>= function
       | Ok { asks; bids; seq } ->
         let evts = List.map (bids @ asks) ~f:(fun evt -> DB.BModify evt) in
         let buf = Bigstring.create @@ DB.bin_size_t evts in
@@ -77,7 +78,7 @@ let ws ~db symbol =
     store seq @@ List.map args ~f:map_f
   | msg -> failwith (Fn.compose Yojson.Safe.to_string Wamp.msg_to_yojson msg)
   in
-  let ws = Ws.open_connection ~log:Lazy.(force log) ~topics:[Uri.of_string symbol] () in
+  let ws = Ws.open_connection ~log:Lazy.(force log) ~topics:[Uri.of_string sym_polo] () in
   Monitor.handle_errors
     (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
     (fun exn -> error "%s" @@ Exn.to_string exn)
