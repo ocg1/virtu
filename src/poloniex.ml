@@ -105,8 +105,8 @@ let command =
     empty
     +> flag "-daemon" no_arg ~doc:" Daemonize"
     +> flag "-datadir" (optional_with_default "data/poloniex.com" string) ~doc:"path Where to store DBs (data/poloniex.com)"
-    +> flag "-pidfile" (optional_with_default "run/poloniex_data.pid" string) ~doc:"filename Path of the pid file (run/bitmex_data.pid)"
-    +> flag "-logfile" (optional_with_default "log/poloniex_data.log" string) ~doc:"filename Path of the log file (log/bitmex_data.log)"
+    +> flag "-pidfile" (optional_with_default "run/poloniex.pid" string) ~doc:"filename Path of the pid file (run/poloniex.pid)"
+    +> flag "-logfile" (optional_with_default "log/poloniex.log" string) ~doc:"filename Path of the log file (log/poloniex.log)"
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
     +> anon ("symbol" %: string)
   in
