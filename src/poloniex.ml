@@ -54,36 +54,31 @@ let ws ~db symbol =
     | `Int i -> i
     | #Yojson.Safe.json -> failwith "seq"
     in
-    debug "%d %s" seq @@ Yojson.Safe.to_string (`List args);
     let map_f msg = match Ws.of_yojson msg with
     | Error msg -> failwith msg
-    | Ok { typ="newTrade"; data } -> begin
-        match trade_raw_of_yojson data with
-        | Error msg -> invalid_arg msg
-        | Ok trade_raw ->
-          let trade = trade_of_trade_raw trade_raw in
-          debug "%s" @@ Fn.compose Sexp.to_string  sexp_of_trade trade;
-          DB.Trade trade
-      end
+    | Ok { typ="newTrade"; data } ->
+      let trade = trade_raw_of_yojson data |> Result.ok_or_failwith |> trade_of_trade_raw in
+      debug "%d T %s" seq @@ Fn.compose Sexp.to_string  sexp_of_trade trade;
+      DB.Trade trade
     | Ok { typ="orderBookModify"; data } ->
       let update = Ws.book_raw_of_yojson data |> Result.ok_or_failwith |> Ws.book_of_book_raw in
-      debug "%s" @@ Fn.compose Sexp.to_string sexp_of_book_entry update;
+      debug "%d M %s" seq @@ Fn.compose Sexp.to_string sexp_of_book_entry update;
       DB.BModify update
     | Ok { typ="orderBookRemove"; data } ->
       let update = Ws.book_raw_of_yojson data |> Result.ok_or_failwith |> Ws.book_of_book_raw in
-      debug "%s" @@ Fn.compose Sexp.to_string sexp_of_book_entry update;
+      debug "%d D %s" seq @@ Fn.compose Sexp.to_string sexp_of_book_entry update;
       DB.BRemove update
     | Ok { typ } -> failwithf "unexpected message type %s" typ ()
     in
     store seq @@ List.map args ~f:map_f
   | msg -> failwith (Fn.compose Yojson.Safe.to_string Wamp.msg_to_yojson msg)
   in
-  let ws = Ws.open_connection ~log:Lazy.(force log) ~topics:[Uri.of_string sym_polo] () in
+  let ws = Ws.open_connection ~topics:[Uri.of_string sym_polo] () in
   Monitor.handle_errors
     (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
     (fun exn -> error "%s" @@ Exn.to_string exn)
 
-let main daemon datadir pidfile logfile loglevel symbol () =
+let record daemon datadir pidfile logfile loglevel symbol () =
   let db = LevelDB.open_db @@ datadir // symbol in
   if daemon then Daemon.daemonize ~cd:"." ();
   Signal.(handle terminating ~f:(fun _ ->
@@ -100,7 +95,7 @@ let main daemon datadir pidfile logfile loglevel symbol () =
   end;
   never_returns @@ Scheduler.go ()
 
-let command =
+let record =
   let spec =
     let open Command.Spec in
     empty
@@ -111,6 +106,44 @@ let command =
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
     +> anon ("symbol" %: string)
   in
-  Command.basic ~summary:"Poloniex data aggregator" spec main
+  Command.basic ~summary:"Poloniex data aggregator" spec record
+
+let show datadir rev_iter max_ticks symbol () =
+  let nb_read = ref 0 in
+  let iter_f = if rev_iter then LevelDB.rev_iter else LevelDB.iter in
+  let db = LevelDB.open_db @@ datadir // symbol in
+  Exn.protectx
+    ~finally:LevelDB.close
+    ~f:(iter_f (fun seq data ->
+        let seq = Binary_packing.unpack_signed_64_int_big_endian ~buf:seq ~pos:0 in
+        let update = DB.bin_read_t ~pos_ref:(ref 0) @@ Bigstring.of_string data in
+        begin if List.length update > 100 then
+            Format.printf "%d (Partial)@." seq
+          else
+          Format.printf "%d %a@." seq Sexp.pp @@ DB.sexp_of_t update
+        end;
+        incr nb_read;
+        Option.value_map max_ticks
+          ~default:true ~f:(fun max_ticks -> not (!nb_read = max_ticks))
+      ))
+    db
+
+let show =
+  let spec =
+    let open Command.Spec in
+    empty
+    +> flag "-datadir" (optional_with_default "data/poloniex.com" string) ~doc:"path Where to store DBs (data/poloniex.com)"
+    +> flag "-rev-iter" no_arg ~doc:" Show latest records"
+    +> flag "-n" (optional int) ~doc:"n Number of ticks to display (default: all)"
+    +> anon ("symbol" %: string)
+  in
+  Command.basic ~summary:"Show LevelDB order book databases" spec show
+
+let command =
+  Command.group ~summary:"Manage order books logging"
+    [
+      "record", record;
+      "show", show;
+    ]
 
 let () = Command.run command
