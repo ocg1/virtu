@@ -112,10 +112,10 @@ let logobs =
   in
   Command.basic ~summary:"Log exchanges order books" spec logobs
 
-let show tail max_ticks dbpath () =
+let show rev_iter max_ticks dbpath () =
   let open Core.Std in
   let nb_read = ref 0 in
-  let iter_f = if tail then LevelDB.rev_iter else LevelDB.iter in
+  let iter_f = if rev_iter then LevelDB.rev_iter else LevelDB.iter in
   let db = LevelDB.open_db dbpath in
   Exn.protectx
     ~finally:LevelDB.close
@@ -135,7 +135,7 @@ let show =
   let spec =
     let open Command.Spec in
     empty
-    +> flag "-tail" no_arg ~doc:" Show latest records"
+    +> flag "-rev-iter" no_arg ~doc:" Show latest records"
     +> flag "-n" (optional int) ~doc:"n Number of ticks to display (default: all)"
     +> anon ("db" %: string)
   in
