@@ -8,26 +8,8 @@ open Bs_api.PLNX
 let (//) = Filename.concat
 
 let polo_of_symbol = function
-  | "ETHXBT" -> "BTC_ETH"
-  | _ -> invalid_arg "polo_of_symbol"
-
-module DB = struct
-  type event =
-    | BModify of book_entry
-    | BRemove of book_entry
-    | Trade of trade [@@deriving sexp, bin_io]
-
-  type t = event list [@@deriving sexp, bin_io]
-
-  let make_store ?sync ?buf db =
-    let key = String.create 8 in
-    let value = Option.value buf ~default:(Bigstring.create 4096) in
-    fun ?(buf=value) seq evts ->
-      Binary_packing.pack_signed_64_int_big_endian ~buf:key ~pos:0 seq;
-      let endp = bin_write_t buf ~pos:0 evts in
-      let value = Bigstring.To_string.sub buf 0 endp in
-      LevelDB.put ?sync db key value
-end
+| "ETHXBT" -> "BTC_ETH"
+| _ -> invalid_arg "polo_of_symbol"
 
 let ws ~db symbol =
   let sym_polo = polo_of_symbol symbol in
@@ -58,15 +40,15 @@ let ws ~db symbol =
     | Error msg -> failwith msg
     | Ok { typ="newTrade"; data } ->
       let trade = trade_raw_of_yojson data |> Result.ok_or_failwith |> trade_of_trade_raw in
-      debug "%d T %s" seq @@ Fn.compose Sexp.to_string  sexp_of_trade trade;
+      debug "%d T %s" seq @@ Fn.compose Sexp.to_string  DB.sexp_of_trade trade;
       DB.Trade trade
     | Ok { typ="orderBookModify"; data } ->
       let update = Ws.book_raw_of_yojson data |> Result.ok_or_failwith |> Ws.book_of_book_raw in
-      debug "%d M %s" seq @@ Fn.compose Sexp.to_string sexp_of_book_entry update;
+      debug "%d M %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
       DB.BModify update
     | Ok { typ="orderBookRemove"; data } ->
       let update = Ws.book_raw_of_yojson data |> Result.ok_or_failwith |> Ws.book_of_book_raw in
-      debug "%d D %s" seq @@ Fn.compose Sexp.to_string sexp_of_book_entry update;
+      debug "%d D %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
       DB.BRemove update
     | Ok { typ } -> failwithf "unexpected message type %s" typ ()
     in
