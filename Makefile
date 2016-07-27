@@ -1,5 +1,5 @@
 all:
-	./build poloniex.byte
+	./build poloniex.byte simu.byte
 
 clean:
 	./build clean
