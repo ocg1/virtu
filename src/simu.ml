@@ -90,7 +90,7 @@ let main gnuplot datadir low high (symbol, max_pos_size) () =
     let bb_price, bb_qty = best_bid bids in
     let ba_price, ba_qty = best_ask asks in
     let mid_price = (ba_price + bb_price) / 2 in
-    let cur_contracts_value = mid_price * state.nb_contracts in
+    let cur_contracts_value = mid_price * state.nb_contracts / 100_000_000 in
     let cur_pnl = cur_contracts_value + state.balance in
     let b_distance = mid_price - bb_price in
     let a_distance = ba_price - mid_price in
@@ -119,14 +119,14 @@ let main gnuplot datadir low high (symbol, max_pos_size) () =
           else
             let myask_p, myask_qty = best_ask state.asks in
             let sell_qty = Int.min qty myask_qty in
-            let new_balance = state.balance + myask_p * sell_qty in
+            let new_balance = state.balance + myask_p * sell_qty / 100_000_000 in
             let new_nb_contracts = state.nb_contracts - sell_qty in
             let mybid_qty = mybid_qty + sell_qty in
             let myask_qty = myask_qty - sell_qty in
             let mybids = Int.Map.(add empty mybid_price mybid_qty) in
             let myasks = Int.Map.(add empty myask_price myask_qty) in
             let new_state = { bids=mybids; asks=myasks; balance=new_balance; nb_contracts=new_nb_contracts } in
-            if gnuplot then Format.printf "%d %d %d@." (seq - !init_seq) mid_price (cur_pnl / Int.pow 10 13)
+            if gnuplot then Format.printf "%d %d %d@." (seq - !init_seq) mid_price (cur_pnl / Int.pow 10 5)
             else Format.eprintf "%d %a %a@." seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state new_state);
             new_state
         | DB.Trade ({ ts; side=Sell; price; qty } as trade) ->
@@ -139,14 +139,14 @@ let main gnuplot datadir low high (symbol, max_pos_size) () =
           else
             let mybid_p, mybid_qty = best_bid state.bids in
             let buy_qty = Int.min qty mybid_qty in
-            let new_balance = state.balance - mybid_p * buy_qty in
+            let new_balance = state.balance - mybid_p * buy_qty / 100_000_000 in
             let new_nb_contracts = state.nb_contracts + buy_qty in
             let mybid_qty = mybid_qty - buy_qty in
             let myask_qty = myask_qty + buy_qty in
             let mybids = Int.Map.(add empty mybid_price mybid_qty) in
             let myasks = Int.Map.(add empty myask_price myask_qty) in
             let new_state = { bids=mybids; asks=myasks; balance=new_balance; nb_contracts=new_nb_contracts } in
-            if gnuplot then Format.printf "%d %d %d@." (seq - !init_seq) mid_price (cur_pnl / Int.pow 10 13)
+            if gnuplot then Format.printf "%d %d %d@." (seq - !init_seq) mid_price (cur_pnl / Int.pow 10 5)
             else Format.eprintf "%d %a %a@." seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state new_state);
             new_state
         | _ -> state
