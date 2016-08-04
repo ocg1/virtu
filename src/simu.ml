@@ -27,12 +27,13 @@ module LevelDB_ext = struct
     in
     List.fold evts ~init:(bids, asks) ~f:update_f
 
-  let fold ?(low=Int.min_value) ?(high=Int.max_value) ~init db ~f =
+  let fold ?(low=Int.min_value) ?(high=Int.max_value) ?(size=Int.max_value) ~init db ~f =
     let buf = Bigstring.create 4096 in
     let bids = ref Int.Map.empty in
     let asks = ref Int.Map.empty in
     let state = ref init in
     let initialized = ref false in
+    let nb_processed = ref 0 in
     let iter_f key value =
       let key = Binary_packing.unpack_signed_64_int_big_endian ~buf:key ~pos:0 in
       let len = String.length value in
@@ -56,14 +57,15 @@ module LevelDB_ext = struct
       in
       bids := bids';
       asks := asks';
-      (* Format.eprintf "%d B %d A %d — U %d D %d T %d@." key (Int.Map.length bids') (Int.Map.length asks') ups dels trades; *)
+      (* Format.printf "%d B %d A %d — U %d D %d T %d@." key (Int.Map.length bids') (Int.Map.length asks') ups dels trades; *)
       let state' =
         if not !initialized then !state
         else if Int.Map.is_empty bids' || Int.Map.is_empty asks' then failwith "empty orderbook"
         else f !state bids' asks' key (if partial then [] else evts)
       in
       state := state';
-      Int.between key ~low ~high
+      incr nb_processed;
+      Int.between key ~low ~high && !nb_processed <= size
     in
     LevelDB.iter iter_f db
 
@@ -80,7 +82,7 @@ type state = {
 let best_bid = Int.Map.max_elt_exn
 let best_ask = Int.Map.min_elt_exn
 
-let main gnuplot datadir low high (symbol, max_pos_size) () =
+let main gnuplot datadir low high size (symbol, max_pos_size) () =
   let max_pos_size = max_pos_size * 100_000_000 in
   let ticksize = List.Assoc.find_exn ticksizes symbol in
   let fill_prob = make_fill_prob 0.9 (log 0.9 /. log 0.5) in
@@ -107,53 +109,53 @@ let main gnuplot datadir low high (symbol, max_pos_size) () =
     let mybids = Int.Map.(add empty mybid_price mybid_qty) in
     let myasks = Int.Map.(add empty myask_price myask_qty) in
     let state = { state with bids=mybids; asks=myasks } in
-    List.fold_left evts ~init:state ~f:(fun state evt ->
-        match evt with
-        | DB.Trade ({ ts; side=Buy; price; qty } as trade) ->
-          if Random.float 1. > fill_prob (my_a_distance // a_distance)
-             || state.nb_contracts = - max_pos_size
-          then begin
-            if not gnuplot then Format.eprintf "%d MISS %a %a@." seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state state);
-            { state with bids=mybids; asks=myasks }
-          end
-          else
-            let myask_p, myask_qty = best_ask state.asks in
-            let sell_qty = Int.min qty myask_qty in
-            let new_balance = state.balance + myask_p * sell_qty / 100_000_000 in
-            let new_nb_contracts = state.nb_contracts - sell_qty in
-            let mybid_qty = mybid_qty + sell_qty in
-            let myask_qty = myask_qty - sell_qty in
-            let mybids = Int.Map.(add empty mybid_price mybid_qty) in
-            let myasks = Int.Map.(add empty myask_price myask_qty) in
-            let new_state = { bids=mybids; asks=myasks; balance=new_balance; nb_contracts=new_nb_contracts } in
-            if gnuplot then Format.printf "%d %d %d@." (seq - !init_seq) mid_price (cur_pnl / Int.pow 10 5)
-            else Format.eprintf "%d %a %a@." seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state new_state);
-            new_state
-        | DB.Trade ({ ts; side=Sell; price; qty } as trade) ->
-          if Random.float 1. > fill_prob (my_b_distance // b_distance)
-             || state.nb_contracts = max_pos_size
-          then begin
-            if not gnuplot then Format.eprintf "%d MISS %a %a@." seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state state);
-            { state with bids=mybids; asks=myasks }
-          end
-          else
-            let mybid_p, mybid_qty = best_bid state.bids in
-            let buy_qty = Int.min qty mybid_qty in
-            let new_balance = state.balance - mybid_p * buy_qty / 100_000_000 in
-            let new_nb_contracts = state.nb_contracts + buy_qty in
-            let mybid_qty = mybid_qty - buy_qty in
-            let myask_qty = myask_qty + buy_qty in
-            let mybids = Int.Map.(add empty mybid_price mybid_qty) in
-            let myasks = Int.Map.(add empty myask_price myask_qty) in
-            let new_state = { bids=mybids; asks=myasks; balance=new_balance; nb_contracts=new_nb_contracts } in
-            if gnuplot then Format.printf "%d %d %d@." (seq - !init_seq) mid_price (cur_pnl / Int.pow 10 5)
-            else Format.eprintf "%d %a %a@." seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state new_state);
-            new_state
-        | _ -> state
-      )
+    let fold_evts state = function
+    | DB.Trade ({ ts; side=Buy; price; qty } as trade) ->
+      if Random.float 1. > fill_prob (my_a_distance // a_distance)
+      || state.nb_contracts = - max_pos_size
+      then begin
+        if not gnuplot then Format.printf "%d MISS %a %a@." seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state state);
+        { state with bids=mybids; asks=myasks }
+      end
+      else
+      let myask_p, myask_qty = best_ask state.asks in
+      let sell_qty = Int.min qty myask_qty in
+      let new_balance = state.balance + myask_p * sell_qty / 100_000_000 in
+      let new_nb_contracts = state.nb_contracts - sell_qty in
+      let mybid_qty = mybid_qty + sell_qty in
+      let myask_qty = myask_qty - sell_qty in
+      let mybids = Int.Map.(add empty mybid_price mybid_qty) in
+      let myasks = Int.Map.(add empty myask_price myask_qty) in
+      let new_state = create_state ~bids:mybids ~asks:myasks ~balance:new_balance ~nb_contracts:new_nb_contracts () in
+      if gnuplot then Format.printf "%d %d %d@." seq mid_price (cur_pnl / Int.pow 10 5)
+      else Format.printf "%d %a %a@." seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state new_state);
+      new_state
+    | DB.Trade ({ ts; side=Sell; price; qty } as trade) ->
+      if Random.float 1. > fill_prob (my_b_distance // b_distance)
+      || state.nb_contracts = max_pos_size
+      then begin
+        if not gnuplot then Format.printf "%d MISS %a %a@." seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state state);
+        { state with bids=mybids; asks=myasks }
+      end
+      else
+      let mybid_p, mybid_qty = best_bid state.bids in
+      let buy_qty = Int.min qty mybid_qty in
+      let new_balance = state.balance - mybid_p * buy_qty / 100_000_000 in
+      let new_nb_contracts = state.nb_contracts + buy_qty in
+      let mybid_qty = mybid_qty - buy_qty in
+      let myask_qty = myask_qty + buy_qty in
+      let mybids = Int.Map.(add empty mybid_price mybid_qty) in
+      let myasks = Int.Map.(add empty myask_price myask_qty) in
+      let new_state = create_state ~bids:mybids ~asks:myasks ~balance:new_balance ~nb_contracts:new_nb_contracts () in
+      if gnuplot then Format.printf "%d %d %d@." seq mid_price (cur_pnl / Int.pow 10 5)
+      else Format.printf "%d %a %a@." seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state new_state);
+      new_state
+    | _ -> state
+    in
+    List.fold_left evts ~init:state ~f:fold_evts
   in
   let db_f db =
-    ignore @@ LevelDB_ext.fold ?low ?high ~init:(create_state ()) ~f:blanket db
+    ignore @@ LevelDB_ext.fold ?size ?low ?high ~init:(create_state ()) ~f:blanket db
   in
   let dbdir = Filename.concat datadir symbol in
   if Sys.is_directory_exn dbdir then
@@ -165,8 +167,9 @@ let command =
     empty
     +> flag "-gnuplot" no_arg ~doc:" gnuplot output"
     +> flag "-datadir" (optional_with_default "data/poloniex.com" string) ~doc:"path Path of datadir"
-    +> flag "-low" (optional int) ~doc:"timestamp Low timestamp"
-    +> flag "-high" (optional int) ~doc:"timestamp High timestamp"
+    +> flag "-low" (optional int) ~doc:"int Low DB key"
+    +> flag "-high" (optional int) ~doc:"int High DB key"
+    +> flag "-size" (optional int) ~doc:"int Do not process more than #size DB records"
     +> anon (t2 ("symbol" %: string) ("max_pos_size" %: int))
   in
   Command.basic ~summary:"P/L simulator" spec main
