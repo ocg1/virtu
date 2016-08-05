@@ -92,16 +92,16 @@ let main gnuplot datadir low high size (symbol, max_pos_size) () =
   let ticksize = List.Assoc.find_exn ticksizes symbol in
   let fill_prob = make_fill_prob 0.9 (log 0.9 /. log 0.5) in
   let init_seq = ref 0 in
-  let blanket state bids asks seq evts =
+  let blanket old_state bids asks seq evts =
     if !init_seq = 0 then init_seq := seq;
     let bb_price, bb_qty = best_bid bids in
     let ba_price, ba_qty = best_ask asks in
     let mid_price = (ba_price + bb_price) / 2 in
-    let old_pnl = pnl state in
+    let old_pnl = pnl old_state in
     let b_distance = mid_price - bb_price in
     let a_distance = ba_price - mid_price in
-    let mybid_qty = Int.abs @@ max_pos_size - state.nb_contracts in
-    let myask_qty = Int.abs @@ state.nb_contracts + max_pos_size in
+    let mybid_qty = Int.abs @@ max_pos_size - old_state.nb_contracts in
+    let myask_qty = Int.abs @@ old_state.nb_contracts + max_pos_size in
     let mybid_price, myask_price =
       if bb_price + ticksize = ba_price then
         bb_price, ba_price
@@ -112,7 +112,7 @@ let main gnuplot datadir low high size (symbol, max_pos_size) () =
     let my_a_distance = myask_price - mid_price in
     let mybids = Int.Map.(add empty mybid_price mybid_qty) in
     let myasks = Int.Map.(add empty myask_price myask_qty) in
-    let state = { state with bids=mybids; asks=myasks; mid_price } in
+    let state = { old_state with bids=mybids; asks=myasks; mid_price } in
     let fold_evts state = function
     | DB.BModify _ | BRemove _ -> state
     | Trade ({ ts; side=Buy; price; qty } as trade) ->
@@ -133,13 +133,14 @@ let main gnuplot datadir low high size (symbol, max_pos_size) () =
       let myasks = Int.Map.(add empty myask_price myask_qty) in
       let new_state = { state with bids=mybids; asks=myasks; balance=new_balance; nb_contracts=new_nb_contracts } in
       let new_pnl = pnl new_state in
-      let pnldiff = new_pnl // old_pnl in
-      if pnldiff > 10. || pnldiff < 0.1 then
-        Format.eprintf "%a@.%a@.%f@."
+      let pnlchg = new_pnl // old_pnl in
+      let pnldiff = new_pnl - old_pnl in
+      if pnlchg > 10. || pnlchg < 0.1 then
+        Format.eprintf "%a@.%a@.%d %d %dP %f%%@."
           Sexp.pp (sexp_of_state state)
           Sexp.pp (sexp_of_state new_state)
-          pnldiff;
-      if gnuplot then Format.printf "%d %d %d %f@." seq mid_price (new_pnl / Int.pow 10 5) pnldiff
+          old_pnl new_pnl pnldiff (pnlchg *. 100.);
+      if gnuplot then Format.printf "%d %d %d %d %f@." (seq - !init_seq) mid_price (new_pnl / Int.pow 10 5) pnldiff pnlchg
       else Format.printf "%d %a %a@." seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state new_state);
       new_state
 
@@ -161,13 +162,14 @@ let main gnuplot datadir low high size (symbol, max_pos_size) () =
       let myasks = Int.Map.(add empty myask_price myask_qty) in
       let new_state = { state with bids=mybids; asks=myasks; balance=new_balance; nb_contracts=new_nb_contracts } in
       let new_pnl = pnl new_state in
-      let pnldiff = new_pnl // old_pnl in
-      if pnldiff > 10. || pnldiff < 0.1 then
-        Format.eprintf "%a@.%a@.%f@."
+      let pnlchg = new_pnl // old_pnl in
+      let pnldiff = new_pnl - old_pnl in
+      if pnlchg > 10. || pnlchg < 0.1 then
+        Format.eprintf "%a@.%a@.%d %d %dP %f%%@."
           Sexp.pp (sexp_of_state state)
           Sexp.pp (sexp_of_state new_state)
-          pnldiff;
-      if gnuplot then Format.printf "%d %d %d %f@." seq mid_price (new_pnl / Int.pow 10 5) pnldiff
+          old_pnl new_pnl pnldiff (pnlchg *. 100.);
+      if gnuplot then Format.printf "%d %d %d %d %f@." (seq - !init_seq) mid_price (new_pnl / Int.pow 10 5) pnldiff pnlchg
       else Format.printf "%d %a %a@." seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state new_state);
       new_state
     in
