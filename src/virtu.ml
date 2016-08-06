@@ -384,37 +384,32 @@ let on_orderbook action data =
   in
   List.iter data ~f:iter_f
 
-let market_make buf strategy instruments =
-  let on_ws_msg msg_str =
-    let msg_json = Yojson.Safe.from_string ~buf msg_str in
-    match BMEX.Ws.update_of_yojson msg_json with
-    | Error _ -> begin
-        match BMEX.Ws.response_of_yojson msg_json with
-        | Error _ ->
-          error "%s" msg_str
-        | Ok response ->
-          info "%s" @@ BMEX.Ws.show_response response
-      end; Deferred.unit
-    | Ok { table; action; data } ->
-      let action = BMEX.update_action_of_string action in
-      match table with
-      | "instrument" -> on_instrument action data; Deferred.unit
-      | "orderBookL2" ->
-        if Ivar.is_full instruments_initialized then on_orderbook action data
-        else don't_wait_for begin
-            Ivar.read instruments_initialized >>| fun () ->
-            on_orderbook action data
-          end;
-        Deferred.unit
-      | "order" ->
-        if Ivar.is_full instruments_initialized then on_order action data
-        else don't_wait_for begin
-            Ivar.read instruments_initialized >>| fun () ->
-            on_order action data
-          end;
-        Deferred.unit
-      | "position" -> on_position action data
-      | _ -> error "Invalid table %s" table; Deferred.unit
+let market_make strategy instruments =
+  let on_ws_msg msg = match BMEX.Ws.msg_of_yojson msg with
+  | Welcome -> info "WS: connected"; Deferred.unit
+  | Error msg -> error "BitMEX: error %s" msg; Deferred.unit
+  | Ok { request = { op = "subscribe" }; subscribe; success } -> info "BitMEX: subscribed to %s: %b" subscribe success; Deferred.unit
+  | Ok { success } -> error "BitMEX: unexpected response %s" (Yojson.Safe.to_string msg); Deferred.unit
+  | Update { table; action; data } ->
+    let action = BMEX.update_action_of_string action in
+    match table with
+    | "instrument" -> on_instrument action data; Deferred.unit
+    | "orderBookL2" ->
+      if Ivar.is_full instruments_initialized then on_orderbook action data
+      else don't_wait_for begin
+          Ivar.read instruments_initialized >>| fun () ->
+          on_orderbook action data
+        end;
+      Deferred.unit
+    | "order" ->
+      if Ivar.is_full instruments_initialized then on_order action data
+      else don't_wait_for begin
+          Ivar.read instruments_initialized >>| fun () ->
+          on_order action data
+        end;
+      Deferred.unit
+    | "position" -> on_position action data
+    | _ -> error "Invalid table %s" table; Deferred.unit
   in
   (* Cancel all orders *)
   Order.cancel_all !order_cfg >>= function
@@ -465,7 +460,6 @@ let main cfg port daemon pidfile logfile loglevel wsllevel main dry fixed remfix
     api_secret := secret_cstruct;
     order_cfg := Order.create_cfg ~dry_run:dry ~orders_t:orders ~current_bids ~current_asks ~testnet:(not main) ~key ~secret:secret_cstruct ();
     let instruments = if instruments = [] then quote else instruments in
-    let buf = Bi_outbuf.create 4096 in
     if daemon then Daemon.daemonize ~cd:"." ();
     let log_outputs = Log.Output.[stderr (); file `Text ~filename:logfile] in
     set_output log_outputs;
@@ -488,7 +482,7 @@ let main cfg port daemon pidfile logfile loglevel wsllevel main dry fixed remfix
     | _, Some remfixed -> `FixedRemote remfixed
     in
     Deferred.(all_unit [
-        market_make buf strategy @@ String.Table.keys quoted_instruments;
+        market_make strategy @@ String.Table.keys quoted_instruments;
       ]);
   end;
   never_returns @@ Scheduler.go ()
