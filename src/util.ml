@@ -36,7 +36,7 @@ module Order = struct
           let o = RespObj.of_json o in
           let sym = RespObj.string_exn o "symbol" in
           let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
-          let current_table = match side with `Buy -> cfg.current_bids | `Sell -> cfg.current_asks in
+          let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
           String.Table.set current_table sym o
         );
       Ok res
@@ -45,7 +45,7 @@ module Order = struct
           let o = RespObj.of_json o in
           let sym = RespObj.string_exn o "symbol" in
           let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
-          let current_table = match side with `Buy -> cfg.current_bids | `Sell -> cfg.current_asks in
+          let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
           String.Table.remove current_table sym;
         );
       Error err
@@ -68,7 +68,7 @@ module Order = struct
         | Some o ->
           let sym = RespObj.string_exn o "symbol" in
           let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
-          let current_table = match side with `Buy -> cfg.current_bids | `Sell -> cfg.current_asks in
+          let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
           String.Table.update current_table sym ~f:(function
             | Some old_o -> RespObj.merge old_o o
             | None -> o)
