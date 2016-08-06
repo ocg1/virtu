@@ -141,9 +141,13 @@ let string_of_order = function
 let on_position_update action symbol oldp p =
   let is_in_flight o = Option.is_none @@ RespObj.string o "orderID" in
   let { max_pos_size } = String.Table.find_exn quoted_instruments symbol in
-  let oldQty = Option.value_map oldp ~default:0 ~f:(fun oldp -> RespObj.int64_exn oldp "currentQty" |> Int64.to_int_exn) in
+  let oldQty = Option.map oldp ~f:(fun oldp -> RespObj.int64_exn oldp "currentQty" |> Int64.to_int_exn) in
   let currentQty = RespObj.int64_exn p "currentQty" |> Int64.to_int_exn in
-  if oldQty = currentQty then failwith "position unchanged";
+  let oldQty = match oldQty with
+  | Some oldQty when oldQty = currentQty -> failwith "position unchanged"
+  | None -> 0
+  | Some oldQty -> oldQty
+  in
   debug "[P] %s %s %d -> %d" (OB.sexp_of_action action |> Sexp.to_string) symbol oldQty currentQty;
   let currentBid = String.Table.find current_bids symbol in
   let currentAsk = String.Table.find current_asks symbol in
@@ -276,9 +280,7 @@ let on_position action data =
     if not @@ String.Table.mem quoted_instruments sym then Deferred.unit
     else
     let oldp = String.Table.find positions sym in
-    let p = Option.value_map oldp
-        ~default:p ~f:(fun oldp -> RespObj.merge oldp p)
-    in
+    let p = Option.value_map oldp ~default:p ~f:(fun oldp -> RespObj.merge oldp p) in
     String.Table.set positions sym p;
     Monitor.try_with ~name:"on_position_update"
       (fun () -> on_position_update action sym oldp p) >>| function
