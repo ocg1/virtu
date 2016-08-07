@@ -21,33 +21,39 @@ module Order = struct
   | _, Some orderID when orderID <> "" -> `S, orderID
   | _ -> invalid_arg "oid_of_respobj"
 
+  let position cfg =
+    Monitor.try_with_or_error ~name:"Position.position" begin fun () ->
+      Rest.Position.position ?log:cfg.log
+        ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret ()
+    end
+
   let submit cfg orders =
     if orders = [] then invalid_arg "submit: empty orders";
     if cfg.dry_run then
       Deferred.Or_error.return @@
       Printf.sprintf "[Sim] submitted %s" Yojson.Safe.(to_string @@ `List orders)
     else
-    Monitor.try_with_or_error ~name:"Order.submit" (fun () ->
-        Bs_api.BMEX.Rest.Order.submit ?log:cfg.log
-          ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders
-      ) >>| function
+    Monitor.try_with_or_error ~name:"Order.submit" begin fun () ->
+      Rest.Order.submit ?log:cfg.log
+        ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders
+    end >>| function
     | Ok res ->
-      List.iter orders ~f:(fun o ->
-          let o = RespObj.of_json o in
-          let sym = RespObj.string_exn o "symbol" in
-          let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
-          let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
-          String.Table.set current_table sym o
-        );
+      List.iter orders ~f:begin fun o ->
+        let o = RespObj.of_json o in
+        let sym = RespObj.string_exn o "symbol" in
+        let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
+        let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
+        String.Table.set current_table sym o
+      end;
       Ok res
     | Error err ->
-      List.iter orders ~f:(fun o ->
-          let o = RespObj.of_json o in
-          let sym = RespObj.string_exn o "symbol" in
-          let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
-          let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
-          String.Table.remove current_table sym;
-        );
+      List.iter orders ~f:begin fun o ->
+        let o = RespObj.of_json o in
+        let sym = RespObj.string_exn o "symbol" in
+        let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
+        let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
+        String.Table.remove current_table sym;
+      end;
       Error err
 
   let update cfg orders =
@@ -60,7 +66,7 @@ module Order = struct
         Bs_api.BMEX.Rest.Order.update ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders
       ) >>| function
     | Error err -> Error err
-    | Ok res -> List.iter orders ~f:(fun o ->
+    | Ok res -> List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
         let orig, oid_str = oid_of_respobj o in
         match Uuid.Table.find cfg.orders_t Uuid.(of_string oid_str) with
@@ -72,7 +78,7 @@ module Order = struct
           String.Table.update current_table sym ~f:(function
             | Some old_o -> RespObj.merge old_o o
             | None -> o)
-      );
+      end;
       Ok res
 
   let cancel_all ?symbol ?filter cfg =

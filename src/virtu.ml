@@ -6,7 +6,8 @@ open Log.Global
 
 open Util
 open Bs_devkit.Core
-open Bs_api
+open Bs_api.BMEX
+module B = Bs_api.BMEX
 
 let log_ws = Log.(create ~level:`Error ~on_error:`Raise ~output:[Output.stderr ()])
 
@@ -212,108 +213,16 @@ let on_instrument action data =
     String.Table.set instruments ~key:sym ~data:(RespObj.merge oldInstr i)
   in
   begin match action with
-  | OB.Partial | Insert ->
-    List.iter data ~f:on_partial_insert;
-    Ivar.fill_if_empty instruments_initialized ()
+  | OB.Partial -> List.iter data ~f:on_partial_insert
+  | Insert -> List.iter data ~f:on_partial_insert
   | Update -> List.iter data ~f:on_update
   | _ -> error "instrument: got action %s" (OB.sexp_of_action action |> Sexp.to_string)
   end
 
-let on_order action data =
-  let on_partial o =
-    let o = RespObj.of_json o in
-    let sym = RespObj.string_exn o "symbol" in
-    let side_str = RespObj.string_exn o "side" in
-    let side = BMEX.buy_sell_of_bmex side_str in
-    let current_table = match side with Buy -> current_bids | Sell -> current_asks in
-    let ordOrig, oid_str = Order.oid_of_respobj o in
-    debug "[O] %s %s %s %s" (OB.sexp_of_action action |> Sexp.to_string) sym side_str (String.sub oid_str 0 8);
-    Uuid.(Table.set orders (of_string oid_str) o);
-    String.Table.set current_table sym o
-  in
-  let on_insert_update action o_json =
-    let o = RespObj.of_json o_json in
-    let sym = RespObj.string_exn o "symbol" in
-    let ordOrig, oid_str = Order.oid_of_respobj o in
-    let oid = Uuid.of_string oid_str in
-    let o = match Uuid.Table.find orders oid with None -> o | Some old_o -> RespObj.merge old_o o in
-    Uuid.Table.set orders oid o;
-    let side_str = RespObj.string_exn o "side" in
-    let orderQty = RespObj.int64_exn o "orderQty" in
-    let leavesQty = RespObj.int64_exn o "leavesQty" in
-    let cumQty = RespObj.int64_exn o "cumQty" in
-    debug "[O] %s %s %s %s o=%Ld l=%Ld c=%Ld"
-      (OB.sexp_of_action action |> Sexp.to_string) sym side_str (String.sub oid_str 0 8)
-      orderQty leavesQty cumQty;
-    let side = BMEX.buy_sell_of_bmex side_str in
-    let current_table = match side with Buy -> current_bids | Sell -> current_asks in
-    if ordOrig = `C then begin
-      debug "[O] %s %s := %s" sym side_str @@ String.sub oid_str 0 8;
-      String.Table.set current_table sym o;
-    end
-  in
-  let on_delete o =
-    let o = RespObj.of_json o in
-    let sym = RespObj.string_exn o "symbol" in
-    let ordOrig, oid_str = Order.oid_of_respobj o in
-    let oid = Uuid.of_string oid_str in
-    match Uuid.Table.find orders oid with
-    | None -> ()
-    | Some o ->
-      let side_str = RespObj.string_exn o "side" in
-      let side = BMEX.buy_sell_of_bmex side_str in
-      let current_table = match side with Buy -> current_bids | Sell -> current_asks in
-      debug "[O] %s %s %s" (OB.sexp_of_action action |> Sexp.to_string) side_str (String.sub oid_str 0 8);
-      Uuid.Table.remove orders oid;
-      String.Table.remove current_table sym;
-  in
-  begin match action with
-  | Partial -> List.iter data ~f:on_partial
-  | Insert | Update -> List.iter data ~f:(on_insert_update action)
-  | Delete -> List.iter data ~f:on_delete
-  end
-
-let on_position action data =
-  let on_not_delete action p =
-    let p = RespObj.of_json p in
-    let sym = RespObj.string_exn p "symbol" in
-    if not @@ String.Table.mem quoted_instruments sym then Deferred.unit
-    else
-    let oldp = String.Table.find positions sym in
-    let p = Option.value_map oldp ~default:p ~f:(fun oldp -> RespObj.merge oldp p) in
-    String.Table.set positions sym p;
-    Monitor.try_with ~name:"on_position_update"
-      (fun () -> on_position_update action sym oldp p) >>| function
-    | Ok () -> ()
-    | Error exn -> match Monitor.extract_exn exn with
-    | Failure reason -> info "[P] %s" reason
-    | _ -> error "%s" @@ Exn.(to_string exn)
-  in
-  let on_delete p =
-    let p = RespObj.of_json p in
-    let sym = RespObj.string_exn p "symbol" in
-    if String.Table.mem quoted_instruments sym then begin
-      debug "[P] %s %s" (OB.sexp_of_action action |> Sexp.to_string) sym;
-      String.Table.remove positions sym
-    end
-  in
-  match action with
-  | Delete -> List.iter data ~f:on_delete; Deferred.unit
-  | _ ->
-    if Deferred.is_determined feed_initialized then
-      Deferred.List.iter data ~how:`Sequential ~f:(on_not_delete action)
-    else begin
-      don't_wait_for begin
-        feed_initialized >>= fun () ->
-        Deferred.List.iter data ~how:`Sequential ~f:(on_not_delete action)
-      end;
-      Deferred.unit
-    end
-
 let on_orderbook action data =
   (* debug "<- %s" (Yojson.Safe.to_string (`List data)); *)
   let action_str = OB.sexp_of_action action |> Sexp.to_string in
-  let update_depth action old_book { BMEX.OrderBook.L2.symbol; id; side = side_str; price = new_price; size = new_qty } =
+  let update_depth action old_book { B.OrderBook.L2.symbol; id; side = side_str; price = new_price; size = new_qty } =
     let orders = String.Table.find_exn OrderBook.orders symbol in
     let old_order = Int.Table.find orders id in
     let old_price = Option.map old_order ~f:(fun { price } -> price) in
@@ -349,11 +258,11 @@ let on_orderbook action data =
         (Option.value ~default:Int.max_value new_price)
         (Option.value ~default:Int.max_value new_qty) ()
   in
-  let data = List.map data ~f:(Fn.compose Result.ok_or_failwith BMEX.OrderBook.L2.of_yojson) in
-  let data = List.group data ~break:(fun u u' -> u.BMEX.OrderBook.L2.symbol <> u'.symbol || u.side <> u'.side) in
+  let data = List.map data ~f:(Fn.compose Result.ok_or_failwith B.OrderBook.L2.of_yojson) in
+  let data = List.group data ~break:(fun u u' -> u.symbol <> u'.symbol || u.side <> u'.side) in
   let iter_f = function
-  | (h :: t) as us when String.Table.mem quoted_instruments h.BMEX.OrderBook.L2.symbol ->
-    let side, best_elt_f, books, vwaps = match BMEX.buy_sell_of_bmex h.side with
+  | (h :: t) as us when String.Table.mem quoted_instruments h.B.OrderBook.L2.symbol ->
+    let side, best_elt_f, books, vwaps = match buy_sell_of_bmex h.side with
     | Buy -> Side.Bid, Int.Map.max_elt, OrderBook.bids, OrderBook.bid_vwaps
     | Sell -> Ask, Int.Map.min_elt, OrderBook.asks, OrderBook.ask_vwaps
     in
@@ -386,14 +295,23 @@ let on_orderbook action data =
   in
   List.iter data ~f:iter_f
 
+let import_positions = function
+| `List ps -> List.iter ps ~f:begin fun p ->
+    let p = RespObj.of_json p in
+    let symbol = RespObj.string_exn p "symbol" in
+    String.Table.set positions symbol p
+  end
+| #Yojson.Safe.json -> invalid_arg "import_positions"
+
 let market_make strategy instruments =
-  let on_ws_msg msg = match BMEX.Ws.msg_of_yojson msg with
+  let on_ws_msg msg = match Ws.msg_of_yojson msg with
   | Welcome -> info "WS: connected"; Deferred.unit
   | Error msg -> error "BitMEX: error %s" msg; Deferred.unit
   | Ok { request = { op = "subscribe" }; subscribe; success } -> info "BitMEX: subscribed to %s: %b" subscribe success; Deferred.unit
   | Ok { success } -> error "BitMEX: unexpected response %s" (Yojson.Safe.to_string msg); Deferred.unit
   | Update { table; action; data } ->
-    let action = BMEX.update_action_of_string action in
+    debug "-> %s" (Yojson.Safe.to_string msg);
+    let action = update_action_of_string action in
     match table with
     | "instrument" -> on_instrument action data; Deferred.unit
     | "orderBookL2" ->
@@ -403,35 +321,26 @@ let market_make strategy instruments =
           on_orderbook action data
         end;
       Deferred.unit
-    | "order" ->
-      if Ivar.is_full instruments_initialized then on_order action data
-      else don't_wait_for begin
-          Ivar.read instruments_initialized >>| fun () ->
-          on_order action data
-        end;
-      Deferred.unit
-    | "position" -> on_position action data
+    | "execution" -> Deferred.unit
     | _ -> error "Invalid table %s" table; Deferred.unit
   in
   (* Cancel all orders *)
-  Order.cancel_all !order_cfg >>= function
-  | Error err ->
-    let err_str = Error.to_string_hum err in
-    error "%s" err_str;
-    failwith err_str
-  | Ok _ ->
-    info "all orders canceled";
-    let topics = "order" :: "position" :: List.(map instruments ~f:(fun i -> ["instrument:" ^ i; "orderBookL2:" ^ i]) |> concat) in
-    don't_wait_for @@ dead_man's_switch 60000 15;
-    don't_wait_for (Ivar.read instruments_initialized >>= fun () -> S.update_orders strategy);
-    let ws = BMEX.Ws.open_connection ~log:log_ws ~testnet:!testnet ~auth:(!api_key, !api_secret) ~md:false ~topics () in
-    Monitor.handle_errors
-      (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
-      (fun exn -> error "%s" @@ Exn.to_string exn)
+  Deferred.Or_error.ok_exn (Order.cancel_all !order_cfg) >>= fun _str ->
+  info "all orders canceled";
+  Deferred.Or_error.ok_exn (Order.position !order_cfg) >>= fun positions ->
+  import_positions (Yojson.Safe.from_string positions);
+  info "positions imported";
+  let topics = List.(map instruments ~f:(fun i -> ["execution"; "instrument:" ^ i; "orderBookL2:" ^ i]) |> concat) in
+  don't_wait_for @@ dead_man's_switch 60000 15;
+  don't_wait_for (Ivar.read instruments_initialized >>= fun () -> S.update_orders strategy);
+  let ws = Ws.open_connection ~log:log_ws ~testnet:!testnet ~auth:(!api_key, !api_secret) ~md:false ~topics () in
+  Monitor.handle_errors
+    (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
+    (fun exn -> error "%s" @@ Exn.to_string exn)
 
 let tickers_of_instrument ?log = function
 | "XBTUSD" ->
-  Pipe.map (BMEX.Ws.Kaiko.tickers ()) ~f:(fun { index={ bid; ask } } ->
+  Pipe.map (Ws.Kaiko.tickers ()) ~f:(fun { index={ bid; ask } } ->
       maybe_debug log "[T] Kaiko %s %s" bid ask;
       satoshis_int_of_float_exn @@ Float.of_string bid,
       satoshis_int_of_float_exn @@ Float.of_string ask
@@ -469,14 +378,14 @@ let main cfg port daemon pidfile logfile loglevel wsllevel main dry fixed remfix
     set_level @@ loglevel_of_int loglevel;
     Log.set_level log_ws @@ loglevel_of_int wsllevel;
     hedger_port := port;
-    List.iter instruments ~f:(fun (symbol, max_pos_size) ->
-        let data = create_instrument_info
-            ~max_pos_size
-            ~ticker:(tickers_of_instrument symbol)
-            ()
-        in
-        String.Table.set quoted_instruments ~key:symbol ~data
-      );
+    List.iter instruments ~f:begin fun (symbol, max_pos_size) ->
+      let data = create_instrument_info
+          ~max_pos_size
+          ~ticker:(tickers_of_instrument symbol)
+          ()
+      in
+      String.Table.set quoted_instruments ~key:symbol ~data
+    end;
     info "Virtu starting";
     let strategy = match fixed, remfixed with
     | None, None -> `Fixed 1
