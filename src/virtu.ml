@@ -23,12 +23,14 @@ let quoted_instruments : instrument_info String.Table.t = String.Table.create ()
 
 let instruments : RespObj.t String.Table.t = String.Table.create ()
 let orders : RespObj.t Uuid.Table.t = Uuid.Table.create ()
-let positions : RespObj.t String.Table.t = String.Table.create ()
+let positions : Int.t String.Table.t = String.Table.create ()
 
 let instruments_initialized = Ivar.create ()
+let execs_initialized = Ivar.create ()
 
 let feed_initialized =
   Ivar.read instruments_initialized >>= fun () ->
+  Ivar.read execs_initialized >>= fun () ->
   String.Table.fold quoted_instruments ~init:[]
     ~f:(fun ~key ~data:{ bids_initialized; asks_initialized } a ->
         bids_initialized :: asks_initialized :: a
@@ -139,17 +141,11 @@ let string_of_order = function
 | None, Some clOrdID -> Printf.sprintf "(s %s)" clOrdID
 | _ -> invalid_arg "string_of_order"
 
-let on_position_update action symbol oldp p =
+let on_position_update symbol oldQty diff =
+  let currentQty = oldQty + diff in
   let is_in_flight o = Option.is_none @@ RespObj.string o "orderID" in
   let { max_pos_size } = String.Table.find_exn quoted_instruments symbol in
-  let oldQty = Option.map oldp ~f:(fun oldp -> RespObj.int64_exn oldp "currentQty" |> Int64.to_int_exn) in
-  let currentQty = RespObj.int64_exn p "currentQty" |> Int64.to_int_exn in
-  let oldQty = match oldQty with
-  | Some oldQty when oldQty = currentQty -> failwith "position unchanged"
-  | None -> 0
-  | Some oldQty -> oldQty
-  in
-  debug "[P] %s %s %d -> %d" (OB.sexp_of_action action |> Sexp.to_string) symbol oldQty currentQty;
+  debug "[P] %s %d -> %d" symbol oldQty currentQty;
   let currentBid = String.Table.find current_bids symbol in
   let currentAsk = String.Table.find current_asks symbol in
   begin match currentBid, currentAsk with
@@ -157,10 +153,8 @@ let on_position_update action symbol oldp p =
     if is_in_flight o then failwithf "%s in flight" (RespObj.string_exn o "clOrdID") ()
   | _ -> ()
   end;
-  (* let fw_p_to_hedger c = Rpc.Rpc.dispatch Protocols.Position.t c (symbol, currentQty) in *)
-  (* don't_wait_for @@ Deferred.ignore @@ Rpc.Connection.with_client ~host:"localhost" ~port:!hedger_port fw_p_to_hedger; *)
-  let currentBidQty = Option.value_map (RespObj.int64 p "openOrderBuyQty") ~default:0 ~f:Int64.to_int_exn in
-  let currentAskQty = Option.value_map (RespObj.int64 p "openOrderSellQty") ~default:0 ~f:Int64.to_int_exn in
+  let currentBidQty = Option.value_map (String.Table.find current_bids symbol) ~default:0 ~f:(fun o -> match RespObj.int64 o "leavesQty" with None -> 0 | Some q -> Int64.to_int_exn q) in
+  let currentAskQty = Option.value_map (String.Table.find current_asks symbol) ~default:0 ~f:(fun o -> match RespObj.int64 o "leavesQty" with None -> 0 | Some q -> Int64.to_int_exn q) in
   let newBidQty = Int.max (max_pos_size - currentQty) 0 in
   let newAskQty = Int.max (max_pos_size + currentQty) 0 in
   if currentBidQty = newBidQty && currentAskQty = newAskQty then failwithf "position unchanged" ();
@@ -213,51 +207,55 @@ let on_instrument action data =
     String.Table.set instruments ~key:sym ~data:(RespObj.merge oldInstr i)
   in
   begin match action with
-  | OB.Partial -> List.iter data ~f:on_partial_insert
+  | OB.Partial ->
+    List.iter data ~f:on_partial_insert;
+    Ivar.fill_if_empty instruments_initialized ()
   | Insert -> List.iter data ~f:on_partial_insert
   | Update -> List.iter data ~f:on_update
   | _ -> error "instrument: got action %s" (OB.sexp_of_action action |> Sexp.to_string)
   end
 
+let update_depth action old_book { B.OrderBook.L2.symbol; id; side = side_str; price = new_price; size = new_qty } =
+  let action_str = OB.sexp_of_action action |> Sexp.to_string in
+  let orders = String.Table.find_exn OrderBook.orders symbol in
+  let old_order = Int.Table.find orders id in
+  let old_price = Option.map old_order ~f:(fun { price } -> price) in
+  let old_qty = Option.map old_order ~f:(fun { qty } -> qty) in
+  let new_price = match old_price, new_price with
+  | _, Some newp -> satoshis_int_of_float_exn newp
+  | Some oldp, None -> oldp
+  | _ -> failwithf "update_depth: missing old OB entry" ()
+  in
+  let new_qty = match old_qty, new_qty with
+  | _, Some newq -> newq
+  | Some oldq, None -> oldq
+  | _ -> failwithf "update_depth: missing old OB entry" ()
+  in
+  debug "[OB] %s %s %s %d %d" action_str symbol side_str new_price new_qty;
+  match action, old_price, old_qty, new_price, new_qty with
+  | OB.Delete, Some oldp, Some oldq, _, _ ->
+    Int.Table.remove orders id;
+    book_modify_qty old_book oldp (Int.neg oldq)
+  | Partial, None, None, newp, newq
+  | Insert, None, None, newp, newq ->
+    Int.Table.set orders id { price = newp; qty = newq };
+    book_add_qty old_book newp newq
+  | Update, Some oldp, Some oldq, newp, newq ->
+    Int.Table.set orders id { price = newp; qty = newq };
+    if oldp = newp then
+      book_modify_qty old_book oldp (newq - oldq)
+    else
+    let intermediate_book = book_modify_qty old_book oldp (Int.neg oldq) in
+    book_modify_qty ~allow_empty:true intermediate_book newp newq
+  | _ ->
+    failwithf "update_depth: %s %d %d %d %d"
+      action_str
+      (Option.value ~default:Int.max_value old_price)
+      (Option.value ~default:Int.max_value old_qty)
+      new_price new_qty ()
+
 let on_orderbook action data =
   (* debug "<- %s" (Yojson.Safe.to_string (`List data)); *)
-  let action_str = OB.sexp_of_action action |> Sexp.to_string in
-  let update_depth action old_book { B.OrderBook.L2.symbol; id; side = side_str; price = new_price; size = new_qty } =
-    let orders = String.Table.find_exn OrderBook.orders symbol in
-    let old_order = Int.Table.find orders id in
-    let old_price = Option.map old_order ~f:(fun { price } -> price) in
-    let old_qty = Option.map old_order ~f:(fun { qty } -> qty) in
-    let new_price = match new_price with
-    | Some new_price -> Option.some @@ satoshis_int_of_float_exn new_price
-    | None -> old_price
-    in
-    let new_qty = match new_qty with
-    | Some qty -> Some qty
-    | None -> old_qty
-    in
-    match action, old_price, old_qty, new_price, new_qty with
-    | OB.Delete, Some oldp, Some oldq, _, _ ->
-      Int.Table.remove orders id;
-      book_modify_qty old_book oldp (Int.neg oldq)
-    | Partial, None, None, Some newp, Some newq
-    | Insert, None, None, Some newp, Some newq ->
-      Int.Table.set orders id { price = newp; qty = newq };
-      book_add_qty old_book newp newq
-    | Update, Some oldp, Some oldq, Some newp, Some newq ->
-      Int.Table.set orders id { price = newp; qty = newq };
-      if oldp = newp then
-        book_modify_qty old_book oldp (newq - oldq)
-      else
-        let intermediate_book = book_modify_qty old_book oldp (Int.neg oldq) in
-        book_modify_qty ~allow_empty:true intermediate_book newp newq
-    | _ ->
-      failwithf "update_depth: %s %d %d %d %d"
-        action_str
-        (Option.value ~default:Int.max_value old_price)
-        (Option.value ~default:Int.max_value old_qty)
-        (Option.value ~default:Int.max_value new_price)
-        (Option.value ~default:Int.max_value new_qty) ()
-  in
   let data = List.map data ~f:(Fn.compose Result.ok_or_failwith B.OrderBook.L2.of_yojson) in
   let data = List.group data ~break:(fun u u' -> u.symbol <> u'.symbol || u.side <> u'.side) in
   let iter_f = function
@@ -266,22 +264,23 @@ let on_orderbook action data =
     | Buy -> Side.Bid, Int.Map.max_elt, OrderBook.bids, OrderBook.bid_vwaps
     | Sell -> Ask, Int.Map.min_elt, OrderBook.asks, OrderBook.ask_vwaps
     in
-    let { max_pos_size } = String.Table.find_exn quoted_instruments h.symbol in
-    let old_book = if action = Partial then Int.Map.empty else
+    let old_book = if action = OB.Partial then Int.Map.empty else
       String.Table.find_exn books h.symbol
     in
     let new_book = List.fold_left us ~init:old_book ~f:(update_depth action) in
     String.Table.set books h.symbol new_book;
 
     (* compute vwap *)
-    let max_pos_p, total_v = vwap ~vlimit:max_pos_size side new_book in
-    String.Table.set vwaps ~key:h.symbol ~data:(OrderBook.create_vwap ~max_pos_p ~total_v ());
-    if total_v > 0 then
-      let { divisor } = String.Table.find_exn ticksizes h.symbol in
-      info "[OB] %s %s %s %d %d"
-        (OB.sexp_of_action action |> Sexp.to_string) h.symbol (Side.sexp_of_t side |> Sexp.to_string)
-        (Option.value_map (best_elt_f new_book) ~default:0 ~f:(fun (v, _) -> v / divisor))
-        (max_pos_p / total_v / divisor);
+    (* let { max_pos_size } = String.Table.find_exn quoted_instruments h.symbol in *)
+    (* let max_pos_p, total_v = vwap ~vlimit:max_pos_size side new_book in *)
+    (* String.Table.set vwaps ~key:h.symbol ~data:(OrderBook.create_vwap ~max_pos_p ~total_v ()); *)
+    (* if total_v > 0 then begin *)
+    (*   let { divisor } = String.Table.find_exn ticksizes h.symbol in *)
+    (*   info "[OB] %s %s %s %d %d" *)
+    (*     (OB.sexp_of_action action |> Sexp.to_string) h.symbol (Side.sexp_of_t side |> Sexp.to_string) *)
+    (*     (Option.value_map (best_elt_f new_book) ~default:0 ~f:(fun (v, _) -> v / divisor)) *)
+    (*     (max_pos_p / total_v / divisor) *)
+    (* end; *)
 
     if action = Partial then begin
       debug "[OB] %s %s initialized" h.symbol (Side.sexp_of_t side |> Sexp.to_string);
@@ -295,11 +294,39 @@ let on_orderbook action data =
   in
   List.iter data ~f:iter_f
 
+let on_exec es =
+  List.iter es ~f:begin fun e_json ->
+    debug "%s" @@ Yojson.Safe.to_string e_json;
+    let e = RespObj.of_json e_json in
+    let symbol = RespObj.string_exn e "symbol" in
+    let execType = RespObj.string_exn e "execType" in
+    let orderID = RespObj.string_exn e "orderID" in
+    let clOrdID = RespObj.string_exn e "clOrdID" in
+    let side = RespObj.string_exn e "side" |> buy_sell_of_bmex in
+    let current_table = match side with Buy -> current_bids | Sell -> current_asks in
+    if clOrdID <> "" then String.Table.set current_table symbol e;
+    debug "[E] %s %s (%s)" symbol execType (String.sub orderID 0 8);
+    match execType with
+    | "New"
+    | "Replaced" -> ()
+    | "Trade" ->
+      let lastQty = RespObj.int64_exn e "lastQty" |> Int64.to_int_exn in
+      let lastQty = match side with Buy -> lastQty | Sell -> Int.neg lastQty in
+      String.Table.update positions symbol ~f:begin function
+      | Some qty ->
+        don't_wait_for @@ on_position_update symbol qty lastQty;
+        qty + lastQty
+      | None -> failwithf "no position for %s" symbol ()
+      end
+    | _ -> ()
+  end
+
 let import_positions = function
 | `List ps -> List.iter ps ~f:begin fun p ->
     let p = RespObj.of_json p in
     let symbol = RespObj.string_exn p "symbol" in
-    String.Table.set positions symbol p
+    let currentQty = RespObj.int64_exn p "currentQty" |> Int64.to_int_exn in
+    String.Table.set positions symbol currentQty
   end
 | #Yojson.Safe.json -> invalid_arg "import_positions"
 
@@ -310,7 +337,6 @@ let market_make strategy instruments =
   | Ok { request = { op = "subscribe" }; subscribe; success } -> info "BitMEX: subscribed to %s: %b" subscribe success; Deferred.unit
   | Ok { success } -> error "BitMEX: unexpected response %s" (Yojson.Safe.to_string msg); Deferred.unit
   | Update { table; action; data } ->
-    debug "-> %s" (Yojson.Safe.to_string msg);
     let action = update_action_of_string action in
     match table with
     | "instrument" -> on_instrument action data; Deferred.unit
@@ -321,18 +347,31 @@ let market_make strategy instruments =
           on_orderbook action data
         end;
       Deferred.unit
-    | "execution" -> Deferred.unit
+    | "execution" -> begin
+      if action = Partial then Ivar.fill_if_empty execs_initialized ()
+      else if action = Insert then on_exec data
+      end;
+      Deferred.unit
     | _ -> error "Invalid table %s" table; Deferred.unit
   in
   (* Cancel all orders *)
   Deferred.Or_error.ok_exn (Order.cancel_all !order_cfg) >>= fun _str ->
   info "all orders canceled";
-  Deferred.Or_error.ok_exn (Order.position !order_cfg) >>= fun positions ->
-  import_positions (Yojson.Safe.from_string positions);
+  Deferred.Or_error.ok_exn (Order.position !order_cfg) >>= fun ps ->
+  import_positions (Yojson.Safe.from_string ps);
   info "positions imported";
   let topics = List.(map instruments ~f:(fun i -> ["execution"; "instrument:" ^ i; "orderBookL2:" ^ i]) |> concat) in
   don't_wait_for @@ dead_man's_switch 60000 15;
-  don't_wait_for (Ivar.read instruments_initialized >>= fun () -> S.update_orders strategy);
+  don't_wait_for @@ begin feed_initialized >>= fun () ->
+    Deferred.List.iter instruments ~f:begin fun symbol ->
+      match String.Table.find positions symbol with
+      | None -> Deferred.unit
+      | Some currentQty -> on_position_update symbol currentQty 0
+    end
+  end;
+  don't_wait_for @@ begin feed_initialized >>= fun () ->
+    S.update_orders strategy
+  end;
   let ws = Ws.open_connection ~log:log_ws ~testnet:!testnet ~auth:(!api_key, !api_secret) ~md:false ~topics () in
   Monitor.handle_errors
     (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
