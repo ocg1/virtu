@@ -38,17 +38,13 @@ let log_bmex datadir symbols =
   let open Bs_api.BMEX in
   let topics = List.map symbols ~f:(fun s -> "orderBookL2:" ^ s) in
   let on_orderbook = make_on_orderbook () in
-  let ws = Ws.open_connection ~testnet:false ~topics () in
-  let buf = Bi_outbuf.create 4096 in
-  let on_ws_msg msg_str =
-    let msg_json = Yojson.Safe.from_string ~buf msg_str in
+  let ws = Ws.open_connection ~md:false ~testnet:false ~topics () in
+  let on_ws_msg msg_json =
     match Ws.update_of_yojson msg_json with
     | Error _ -> begin
         match Ws.response_of_yojson msg_json with
-        | Error _ ->
-          error "%s" msg_str
-        | Ok response ->
-          info "%s" @@ Ws.show_response response
+        | Error _ -> error "%s" (Yojson.Safe.to_string msg_json)
+        | Ok response -> info "%s" @@ Ws.show_response response
       end
     | Ok { table; action; data } ->
       let action = update_action_of_string action in
@@ -59,9 +55,6 @@ let log_bmex datadir symbols =
   Monitor.handle_errors
     (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
     (fun exn -> error "%s" @@ Exn.to_string exn)
-
-let log_bfx datadir symbols =
-  Deferred.never ()
 
 let logobs daemon rundir logdir datadir loglevel instruments () =
   let instruments = List.fold_left instruments ~init:String.Map.empty ~f:(fun a (exchange, symbol) ->
@@ -91,9 +84,6 @@ let logobs daemon rundir logdir datadir loglevel instruments () =
             String.Table.set bmex_dbs s (LevelDB.open_db path)
           );
         don't_wait_for @@ log_bmex datadir syms
-      );
-    Option.iter (String.Map.find instruments "BFX") ~f:(fun syms ->
-        don't_wait_for @@ log_bfx datadir syms
       );
     Deferred.never ()
   end;
