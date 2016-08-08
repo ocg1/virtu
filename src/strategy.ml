@@ -38,7 +38,7 @@ module Common (C : Cfg) = struct
       if old_price = new_price then None else begin
         Log.info log "update order price %s %s %s %d -> %d" symbol (Side.sexp_of_t side |> Sexp.to_string) (String.sub oid 0 8) (old_price / tickSize) (new_price / tickSize);
         let ticksize = String.Table.find_exn ticksizes symbol in
-        Option.some @@ mk_amended_limit_order ~symbol ~ticksize ~price:new_price orig oid
+        Option.some @@ mk_amended_limit_order ~symbol ~side ~ticksize ~price:new_price orig oid
       end
     in
     Option.Monad_infix.(current_working_order symbol side >>= mk_order)

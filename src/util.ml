@@ -7,7 +7,6 @@ open Bs_api.BMEX
 module Order = struct
   type cfg = {
     dry_run: bool [@default false];
-    orders_t: RespObj.t Uuid.Table.t [@default Uuid.Table.create ()];
     current_bids: RespObj.t String.Table.t [@default String.Table.create ()];
     current_asks: RespObj.t String.Table.t [@default String.Table.create ()];
     testnet: bool [@default true];
@@ -68,16 +67,13 @@ module Order = struct
     | Error err -> Error err
     | Ok res -> List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
-        let orig, oid_str = oid_of_respobj o in
-        match Uuid.Table.find cfg.orders_t Uuid.(of_string oid_str) with
-        | None -> ()
-        | Some o ->
-          let sym = RespObj.string_exn o "symbol" in
-          let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
-          let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
-          String.Table.update current_table sym ~f:(function
-            | Some old_o -> RespObj.merge old_o o
-            | None -> o)
+        let sym = RespObj.string_exn o "symbol" in
+        let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
+        let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
+        String.Table.update current_table sym ~f:begin function
+          | Some old_o -> RespObj.merge old_o o
+          | None -> o
+        end
       end;
       Ok res
 
@@ -172,8 +168,10 @@ let mk_new_limit_order ~symbol ~ticksize ~side ~price ~qty uuid_str =
     "execInst", `String "ParticipateDoNotInitiate"
   ]
 
-let mk_amended_limit_order ?price ?qty ~symbol ~ticksize orig oid =
+let mk_amended_limit_order ?price ?qty ~symbol ~side ~ticksize orig oid =
   `Assoc (List.filter_opt [
+      Some ("symbol", `String symbol);
+      Some ("side", `String (match side with Side.Bid -> "Buy" | Ask -> "Sell"));
       Some ((match orig with `S -> "orderID" | `C -> "clOrdID"), `String oid);
       Option.map qty ~f:(fun qty -> "leavesQty", `Int qty);
       Option.map price ~f:(fun price -> "price", `Float (float_of_satoshis symbol ticksize price));

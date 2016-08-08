@@ -22,7 +22,6 @@ let hedger_port = ref 0
 let quoted_instruments : instrument_info String.Table.t = String.Table.create ()
 
 let instruments : RespObj.t String.Table.t = String.Table.create ()
-let orders : RespObj.t Uuid.Table.t = Uuid.Table.create ()
 let positions : Int.t String.Table.t = String.Table.create ()
 
 let instruments_initialized = Ivar.create ()
@@ -131,7 +130,7 @@ let compute_orders ?order symbol side price newQty =
     Some (clOrdID, mk_new_limit_order ~symbol ~side ~ticksize ~price ~qty:newQty clOrdID), None
   | Some leavesQty when leavesQty > 0 || leavesQty = 0 && newQty > 0 ->
     let orig, oid = Order.oid_of_respobj (Option.value_exn order) in
-    None, Some (oid, mk_amended_limit_order ~symbol ~ticksize ~price ~qty:newQty orig oid)
+    None, Some (oid, mk_amended_limit_order ~symbol ~side ~ticksize ~price ~qty:newQty orig oid)
   | _ -> None, None
 
 let string_of_order = function
@@ -408,7 +407,7 @@ let main cfg port daemon pidfile logfile loglevel wsllevel main dry fixed remfix
     testnet := not main;
     api_key := key;
     api_secret := secret_cstruct;
-    order_cfg := Order.create_cfg ~dry_run:dry ~orders_t:orders ~current_bids ~current_asks ~testnet:(not main) ~key ~secret:secret_cstruct ();
+    order_cfg := Order.create_cfg ~dry_run:dry ~current_bids ~current_asks ~testnet:(not main) ~key ~secret:secret_cstruct ();
     let instruments = if instruments = [] then quote else instruments in
     if daemon then Daemon.daemonize ~cd:"." ();
     let log_outputs = Log.Output.[stderr (); file `Text ~filename:logfile] in
