@@ -33,27 +33,29 @@ let ws ~db symbol =
     debug "subscribed %s" symbol
   | Event { Wamp.pubid; subid; details; args; kwArgs } ->
     let seq = match List.Assoc.find_exn kwArgs "seq" with
-    | `Int i -> i
-    | #Yojson.Safe.json -> failwith "seq"
+    | Msgpck.Int i -> i
+    | _ -> failwith "seq"
     in
-    let map_f msg = match Ws.of_yojson msg with
-    | Error msg -> failwith msg
-    | Ok { typ="newTrade"; data } ->
-      let trade = trade_raw_of_yojson data |> Result.ok_or_failwith |> trade_of_trade_raw in
-      debug "%d T %s" seq @@ Fn.compose Sexp.to_string  DB.sexp_of_trade trade;
-      DB.Trade trade
-    | Ok { typ="orderBookModify"; data } ->
-      let update = Ws.book_raw_of_yojson data |> Result.ok_or_failwith |> Ws.book_of_book_raw in
-      debug "%d M %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
-      DB.BModify update
-    | Ok { typ="orderBookRemove"; data } ->
-      let update = Ws.book_raw_of_yojson data |> Result.ok_or_failwith |> Ws.book_of_book_raw in
-      debug "%d D %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
-      DB.BRemove update
-    | Ok { typ } -> failwithf "unexpected message type %s" typ ()
+    let map_f msg =
+      let open Ws.Msgpck in
+      match of_msgpck msg with
+      | Error msg -> failwith msg
+      | Ok { typ="newTrade"; data } ->
+        let trade = trade_of_msgpck data in
+        debug "%d T %s" seq @@ Fn.compose Sexp.to_string  DB.sexp_of_trade trade;
+        DB.Trade trade
+      | Ok { typ="orderBookModify"; data } ->
+        let update = book_of_msgpck data in
+        debug "%d M %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
+        DB.BModify update
+      | Ok { typ="orderBookRemove"; data } ->
+        let update = book_of_msgpck data in
+        debug "%d D %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
+        DB.BRemove update
+      | Ok { typ } -> failwithf "unexpected message type %s" typ ()
     in
     store seq @@ List.map args ~f:map_f
-  | msg -> failwith (Fn.compose Yojson.Safe.to_string Wamp.msg_to_yojson msg)
+  | msg -> error "unknown message: %s" (Wamp.sexp_of_msg Msgpck.sexp_of_t msg |> Sexplib.Sexp.to_string)
   in
   let ws = Ws.open_connection ~topics:[Uri.of_string sym_polo] () in
   Monitor.handle_errors

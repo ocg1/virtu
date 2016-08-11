@@ -378,7 +378,7 @@ let market_make strategy instruments =
 
 let tickers_of_instrument ?log = function
 | "XBTUSD" ->
-  Pipe.map (Ws.Kaiko.tickers ()) ~f:(fun { index={ bid; ask } } ->
+  Pipe.map (Ws.Kaiko.tickers ["bitmex"]) ~f:(fun { index={ bid; ask } } ->
       maybe_debug log "[T] Kaiko %s %s" bid ask;
       satoshis_int_of_float_exn @@ Float.of_string bid,
       satoshis_int_of_float_exn @@ Float.of_string ask
@@ -388,7 +388,7 @@ let tickers_of_instrument ?log = function
   let evts = Ws.open_connection ~topics:[Uri.of_string "ticker"] () in
   Pipe.filter_map evts ~f:(function
     | Event { args } ->
-      let { Ws.symbol; bid; ask } = Ws.ticker_of_json @@ `List args in
+      let { Ws.symbol; bid; ask } = Ws.Msgpck.ticker_of_msgpck @@ Msgpck.List args in
       if symbol <> to_remote_sym "ETHXBT" then None
       else begin
         maybe_debug log "[T] PLNX %s %f %f" symbol bid ask;
