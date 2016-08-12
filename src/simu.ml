@@ -16,13 +16,13 @@ module LevelDB_ext = struct
     | DB.Trade _ -> (bids, asks)
     | BModify { side; price; qty } -> begin
       match side with
-      | Bid -> Int.Map.add bids price qty, asks
-      | Ask -> bids, Int.Map.add asks price qty
+      | Buy -> Int.Map.add bids price qty, asks
+      | Sell -> bids, Int.Map.add asks price qty
       end
     | BRemove { side; price } -> begin
       match side with
-      | Bid -> Int.Map.remove bids price, asks
-      | Ask -> bids, Int.Map.remove asks price
+      | Buy -> Int.Map.remove bids price, asks
+      | Sell -> bids, Int.Map.remove asks price
       end
     in
     List.fold evts ~init:(bids, asks) ~f:update_f
@@ -44,7 +44,7 @@ module LevelDB_ext = struct
         let nb_trades = List.count evts ~f:(function DB.Trade _ -> true | _ -> false) in
         nb_mods, nb_dels, nb_trades
       in
-      let evts = DB.bin_read_t ~pos_ref:(ref 0) buf in
+      let evts = DB.bin_read_t_list ~pos_ref:(ref 0) buf in
       let evts_len = List.length evts in
       let ups, dels, trades = evts_stats evts in
       let partial = evts_len > 50 && trades = 0 in

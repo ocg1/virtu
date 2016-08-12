@@ -1,6 +1,7 @@
 open Core.Std
 open Async.Std
 
+open Dtc
 open Bs_devkit.Core
 open Bs_api.BMEX
 open Util
@@ -16,7 +17,7 @@ module type Cfg = sig
   val ticksizes : ticksize String.Table.t
   val local_best_price :
     ?remove_order:(int * int) ->
-    Side.t -> string -> (int * int) option
+    Dtc.side -> string -> (int * int) option
 end
 
 module Common (C : Cfg) = struct
@@ -24,7 +25,7 @@ module Common (C : Cfg) = struct
 
   let current_working_order symbol side =
     let open Option.Monad_infix in
-    let current_orders = match side with Side.Bid -> current_bids | Ask -> current_asks in
+    let current_orders = match side with Dtc.Buy -> current_bids | Sell -> current_asks in
     String.Table.find current_orders symbol >>= fun o ->
     RespObj.int64 o "leavesQty" >>= fun leavesQty ->
     RespObj.bool o "workingIndicator" >>= fun working ->
@@ -36,7 +37,7 @@ module Common (C : Cfg) = struct
       let old_price = satoshis_int_of_float_exn @@ RespObj.float_exn o "price" in
       let new_price = match dprice with `Abs p -> p | `Diff dp -> old_price + dp in
       if old_price = new_price then None else begin
-        Log.info log "update order price %s %s %s %d -> %d" symbol (Side.sexp_of_t side |> Sexp.to_string) (String.sub oid 0 8) (old_price / tickSize) (new_price / tickSize);
+        Log.info log "update order price %s %s %s %d -> %d" symbol (Dtc.sexp_of_side side |> Sexp.to_string) (String.sub oid 0 8) (old_price / tickSize) (new_price / tickSize);
         let ticksize = String.Table.find_exn ticksizes symbol in
         Option.some @@ mk_amended_limit_order ~symbol ~side ~ticksize ~price:new_price orig oid
       end
@@ -63,16 +64,16 @@ module Blanket (C : Cfg) = struct
     let newAsk = Int.(max newAsk @@ locBid + tickSize) in
     let newAsk = Int.(max newAsk @@ newBid + tickSize) in
     List.filter_opt [
-      update_orders_price symbol Bid (`Abs newBid) tickSize;
-      update_orders_price symbol Ask (`Abs newAsk) tickSize
+      update_orders_price symbol Buy (`Abs newBid) tickSize;
+      update_orders_price symbol Sell (`Abs newAsk) tickSize
     ]
 
   let update_orders strategy =
     let iter_f (symbol, { ticker }) =
       let { divisor=tickSize } = String.Table.find_exn ticksizes symbol in
       let update_f =
-        let oldLocBid = local_best_price Bid symbol |> Option.map ~f:fst |> Ref.create in
-        let oldLocAsk = local_best_price Ask symbol |> Option.map ~f:fst |> Ref.create in
+        let oldLocBid = local_best_price Buy symbol |> Option.map ~f:fst |> Ref.create in
+        let oldLocAsk = local_best_price Sell symbol |> Option.map ~f:fst |> Ref.create in
         let oldRemBid = ref 0 in
         let oldRemAsk = ref 0 in
         let latest_update = ref Time_ns.epoch in
@@ -84,12 +85,12 @@ module Blanket (C : Cfg) = struct
           if Time_ns.Span.(time_elapsed < of_int_ms 1500) then Deferred.unit
           else begin
             latest_update := now;
-            let currentBidOrder = current_working_order symbol Bid in
-            let currentAskOrder = current_working_order symbol Ask in
+            let currentBidOrder = current_working_order symbol Buy in
+            let currentAskOrder = current_working_order symbol Sell in
             let currentBidPQty = Option.bind currentBidOrder price_qty_of_order in
             let currentAskPQty = Option.bind currentAskOrder price_qty_of_order in
-            let newLocBid = local_best_price ?remove_order:currentBidPQty Bid symbol |> Option.map ~f:fst in
-            let newLocAsk = local_best_price ?remove_order:currentAskPQty Ask symbol |> Option.map ~f:fst in
+            let newLocBid = local_best_price ?remove_order:currentBidPQty Buy symbol |> Option.map ~f:fst in
+            let newLocAsk = local_best_price ?remove_order:currentAskPQty Sell symbol |> Option.map ~f:fst in
             let orders =
               match !oldLocBid, !oldLocAsk, newLocBid, newLocAsk with
               | Some oldlb, Some oldla, Some newlb, Some newla when oldlb <> oldla || newlb <> newla || newRemBid <> !oldRemBid || newRemAsk <> !oldRemAsk ->

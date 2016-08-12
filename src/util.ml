@@ -1,6 +1,7 @@
 open Core.Std
 open Async.Std
 
+open Dtc
 open Bs_devkit.Core
 open Bs_api.BMEX
 
@@ -40,7 +41,7 @@ module Order = struct
       List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
         let sym = RespObj.string_exn o "symbol" in
-        let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
+        let side = RespObj.string_exn o "side" |> buy_sell_of_bmex |> Result.ok_or_failwith in
         let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
         String.Table.set current_table sym o
       end;
@@ -49,7 +50,7 @@ module Order = struct
       List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
         let sym = RespObj.string_exn o "symbol" in
-        let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
+        let side = RespObj.string_exn o "side" |> buy_sell_of_bmex |> Result.ok_or_failwith in
         let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
         String.Table.remove current_table sym;
       end;
@@ -68,7 +69,7 @@ module Order = struct
     | Ok res -> List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
         let sym = RespObj.string_exn o "symbol" in
-        let side = RespObj.string_exn o "side" |> buy_sell_of_bmex in
+        let side = RespObj.string_exn o "side" |> buy_sell_of_bmex |> Result.ok_or_failwith in
         let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
         String.Table.update current_table sym ~f:begin function
           | Some old_o -> RespObj.merge old_o o
@@ -134,8 +135,8 @@ let book_modify_qty ?(allow_empty=false) book price qty =
     )
 
 let best_of_side = function
-| Side.Bid -> Int.Map.max_elt
-| Ask -> Int.Map.min_elt
+| Dtc.Buy -> Int.Map.max_elt
+| Sell -> Int.Map.min_elt
 
 let exponent_divisor_of_tickSize tickSize =
   let ts_str = Printf.sprintf "%.0e" tickSize in
@@ -162,7 +163,7 @@ let mk_new_limit_order ~symbol ~ticksize ~side ~price ~qty uuid_str =
   `Assoc [
     "clOrdID", `String uuid_str;
     "symbol", `String symbol;
-    "side", `String (match side with Side.Bid -> "Buy" | Ask -> "Sell");
+    "side", `String (match side with Dtc.Buy -> "Buy" | Sell -> "Sell");
     "price", `Float (float_of_satoshis symbol ticksize price);
     "orderQty", `Int qty;
     "execInst", `String "ParticipateDoNotInitiate"
@@ -171,7 +172,7 @@ let mk_new_limit_order ~symbol ~ticksize ~side ~price ~qty uuid_str =
 let mk_amended_limit_order ?price ?qty ~symbol ~side ~ticksize orig oid =
   `Assoc (List.filter_opt [
       Some ("symbol", `String symbol);
-      Some ("side", `String (match side with Side.Bid -> "Buy" | Ask -> "Sell"));
+      Some ("side", `String (match side with Dtc.Buy -> "Buy" | Sell -> "Sell"));
       Some ((match orig with `S -> "orderID" | `C -> "clOrdID"), `String oid);
       Option.map qty ~f:(fun qty -> "leavesQty", `Int qty);
       Option.map price ~f:(fun price -> "price", `Float (float_of_satoshis symbol ticksize price));

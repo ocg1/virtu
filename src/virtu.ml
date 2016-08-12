@@ -4,6 +4,7 @@ open Core.Std
 open Async.Std
 open Log.Global
 
+open Dtc
 open Util
 open Bs_devkit.Core
 open Bs_api.BMEX
@@ -47,7 +48,7 @@ module OrderBook = struct
 
   let bids : (Int.t Int.Map.t) String.Table.t = String.Table.create ()
   let asks : (Int.t Int.Map.t) String.Table.t = String.Table.create ()
-  let book_of_side = function Side.Bid -> bids | Ask -> asks
+  let book_of_side = function Dtc.Buy -> bids | Sell -> asks
 
   let best_price ?remove_order side symbol =
     let open Option.Monad_infix in
@@ -64,7 +65,7 @@ module OrderBook = struct
 
   let bid_vwaps : vwap String.Table.t = String.Table.create ()
   let ask_vwaps : vwap String.Table.t = String.Table.create ()
-  let vwaps_of_side = function Side.Bid -> bid_vwaps | Ask -> ask_vwaps
+  let vwaps_of_side = function Dtc.Buy -> bid_vwaps | Sell -> ask_vwaps
 
   let vwap side symbol =
     let vwaps = vwaps_of_side side in
@@ -72,15 +73,15 @@ module OrderBook = struct
 
   let mid_price ?remove_bid ?remove_ask symbol = function
     | Best ->
-      let best_bid = best_price ?remove_order:remove_bid Side.Bid symbol in
-      let best_ask = best_price ?remove_order:remove_ask Ask symbol in
+      let best_bid = best_price ?remove_order:remove_bid Dtc.Buy symbol in
+      let best_ask = best_price ?remove_order:remove_ask Sell symbol in
       Option.map2 best_bid best_ask (fun (bb,_) (ba,_) ->
           let midPrice =  (bb + ba) / 2 in
           midPrice, ba - midPrice
         )
     | Vwap ->
-      let vwap_bid = vwap Side.Bid symbol in
-      let vwap_ask = vwap Ask symbol in
+      let vwap_bid = vwap Dtc.Buy symbol in
+      let vwap_ask = vwap Sell symbol in
       Option.map2 vwap_bid vwap_ask
         (fun { max_pos_p=mp; total_v=tv } { max_pos_p=mp'; total_v=tv' } ->
            let vb = mp / tv in
@@ -123,7 +124,7 @@ let compute_orders ?order symbol side price newQty =
   let leavesQty = Option.map order ~f:(fun o -> RespObj.int64_exn o "leavesQty" |> Int64.to_int_exn) in
   let ticksize = String.Table.find_exn ticksizes symbol in
   let leavesQtySexp = Option.sexp_of_t Int.sexp_of_t leavesQty |> Sexp.to_string_hum in
-  debug "compute_orders %s %s %d %s %d" symbol (Side.sexp_of_t side |> Sexp.to_string) (price / ticksize.divisor) leavesQtySexp newQty;
+  debug "compute_orders %s %s %d %s %d" symbol (Dtc.sexp_of_side side |> Sexp.to_string) (price / ticksize.divisor) leavesQtySexp newQty;
   match leavesQty with
   | None when newQty > 0 ->
     let clOrdID = Uuid.(create () |> to_string) in
@@ -161,18 +162,18 @@ let on_position_update symbol oldQty diff =
   info "current orders: %s %s" (string_of_order currentBid) (string_of_order currentAsk);
   let currentBid = Option.bind currentBid (fun o -> if is_in_flight o then None else Some o) in
   let currentAsk = Option.bind currentAsk (fun o -> if is_in_flight o then None else Some o) in
-  let bidPrice = match Option.(currentBid >>= price_qty_of_order), OrderBook.best_price Bid symbol with
+  let bidPrice = match Option.(currentBid >>= price_qty_of_order), OrderBook.best_price Buy symbol with
   | Some (price, _qty), _ -> price
   | None, Some (price, _qty) -> price
   | _ -> failwith "No suitable bid price found"
   in
-  let askPrice = match Option.(currentAsk >>= price_qty_of_order), OrderBook.best_price Ask symbol with
+  let askPrice = match Option.(currentAsk >>= price_qty_of_order), OrderBook.best_price Sell symbol with
   | Some (price, _qty), _ -> price
   | None, Some (price, _qty) -> price
   | _ -> failwith "No suitable ask price found"
   in
-  let bidSubmit, bidAmend = compute_orders ?order:currentBid symbol Bid bidPrice newBidQty in
-  let askSubmit, askAmend = compute_orders ?order:currentAsk symbol Ask askPrice newAskQty in
+  let bidSubmit, bidAmend = compute_orders ?order:currentBid symbol Buy bidPrice newBidQty in
+  let askSubmit, askAmend = compute_orders ?order:currentAsk symbol Sell askPrice newAskQty in
   let make_th f orders = match
     List.fold_left orders ~init:[]
       ~f:(fun a -> function None -> a | Some (_, o) -> o :: a)
@@ -260,8 +261,9 @@ let on_orderbook action data =
   let iter_f = function
   | (h :: t) as us when String.Table.mem quoted_instruments h.B.OrderBook.L2.symbol ->
     let side, best_elt_f, books, vwaps = match buy_sell_of_bmex h.side with
-    | Buy -> Side.Bid, Int.Map.max_elt, OrderBook.bids, OrderBook.bid_vwaps
-    | Sell -> Ask, Int.Map.min_elt, OrderBook.asks, OrderBook.ask_vwaps
+    | Error _ -> failwith "buy_sell_of_bmex"
+    | Ok Buy -> Dtc.Buy, Int.Map.max_elt, OrderBook.bids, OrderBook.bid_vwaps
+    | Ok Sell -> Sell, Int.Map.min_elt, OrderBook.asks, OrderBook.ask_vwaps
     in
     let old_book = if action = OB.Partial then Int.Map.empty else
       String.Table.find_exn books h.symbol
@@ -276,17 +278,17 @@ let on_orderbook action data =
     (* if total_v > 0 then begin *)
     (*   let { divisor } = String.Table.find_exn ticksizes h.symbol in *)
     (*   info "[OB] %s %s %s %d %d" *)
-    (*     (OB.sexp_of_action action |> Sexp.to_string) h.symbol (Side.sexp_of_t side |> Sexp.to_string) *)
+    (*     (OB.sexp_of_action action |> Sexp.to_string) h.symbol (Dtc.sexp_of_t side |> Sexp.to_string) *)
     (*     (Option.value_map (best_elt_f new_book) ~default:0 ~f:(fun (v, _) -> v / divisor)) *)
     (*     (max_pos_p / total_v / divisor) *)
     (* end; *)
 
     if action = Partial then begin
-      debug "[OB] %s %s initialized" h.symbol (Side.sexp_of_t side |> Sexp.to_string);
+      debug "[OB] %s %s initialized" h.symbol (Dtc.sexp_of_side side |> Sexp.to_string);
       let { bids_initialized; asks_initialized } = String.Table.find_exn quoted_instruments h.symbol in
       match side with
-      | Bid -> Ivar.fill_if_empty bids_initialized ()
-      | Ask -> Ivar.fill_if_empty asks_initialized ()
+      | Buy -> Ivar.fill_if_empty bids_initialized ()
+      | Sell -> Ivar.fill_if_empty asks_initialized ()
     end
 
   | _ -> ()
@@ -301,7 +303,7 @@ let on_exec es =
     let execType = RespObj.string_exn e "execType" in
     let orderID = RespObj.string_exn e "orderID" in
     let clOrdID = RespObj.string_exn e "clOrdID" in
-    let side = RespObj.string_exn e "side" |> buy_sell_of_bmex in
+    let side = RespObj.string_exn e "side" |> buy_sell_of_bmex |> Result.ok_or_failwith in
     let current_table = match side with Buy -> current_bids | Sell -> current_asks in
     if clOrdID <> "" then String.Table.set current_table symbol e;
     debug "[E] %s %s (%s)" symbol execType (String.sub orderID 0 8);
