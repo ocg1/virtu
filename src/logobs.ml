@@ -8,13 +8,13 @@ open Bs_devkit.Core
 module BMEX = Bs_api.BMEX
 
 let update_of_l2 { BMEX.OrderBook.L2.id; side; size; price } =
-  let side = BMEX.buy_sell_of_bmex side |> Result.ok_or_failwith in
+  let side = BMEX.side_of_bmex side |> Result.ok_or_failwith in
   let price = Option.value_map price ~default:0 ~f:satoshis_int_of_float_exn in
   let qty = Option.value ~default:0 size in
   DB.create_book_entry ~side ~price ~qty ()
 
 let trade_of_bmex { BMEX.Trade.symbol; timestamp; side; price; size } =
-  let side = BMEX.buy_sell_of_bmex side |> Result.ok_or_failwith in
+  let side = BMEX.side_of_bmex side |> Result.ok_or_failwith in
   let price = satoshis_int_of_float_exn price in
   let qty = Int64.to_int_exn size in
   let ts = Time_ns.of_string timestamp in

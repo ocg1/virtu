@@ -260,7 +260,7 @@ let on_orderbook action data =
   let data = List.group data ~break:(fun u u' -> u.symbol <> u'.symbol || u.side <> u'.side) in
   let iter_f = function
   | (h :: t) as us when String.Table.mem quoted_instruments h.B.OrderBook.L2.symbol ->
-    let side, best_elt_f, books, vwaps = match buy_sell_of_bmex h.side with
+    let side, best_elt_f, books, vwaps = match side_of_bmex h.side with
     | Error _ -> failwith "buy_sell_of_bmex"
     | Ok Buy -> Dtc.Buy, Int.Map.max_elt, OrderBook.bids, OrderBook.bid_vwaps
     | Ok Sell -> Sell, Int.Map.min_elt, OrderBook.asks, OrderBook.ask_vwaps
@@ -303,7 +303,7 @@ let on_exec es =
     let execType = RespObj.string_exn e "execType" in
     let orderID = RespObj.string_exn e "orderID" in
     let clOrdID = RespObj.string_exn e "clOrdID" in
-    let side = RespObj.string_exn e "side" |> buy_sell_of_bmex |> Result.ok_or_failwith in
+    let side = RespObj.string_exn e "side" |> side_of_bmex |> Result.ok_or_failwith in
     let current_table = match side with Buy -> current_bids | Sell -> current_asks in
     if clOrdID <> "" then String.Table.set current_table symbol e;
     debug "[E] %s %s (%s)" symbol execType (String.sub orderID 0 8);

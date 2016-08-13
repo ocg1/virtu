@@ -41,7 +41,7 @@ module Order = struct
       List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
         let sym = RespObj.string_exn o "symbol" in
-        let side = RespObj.string_exn o "side" |> buy_sell_of_bmex |> Result.ok_or_failwith in
+        let side = RespObj.string_exn o "side" |> side_of_bmex |> Result.ok_or_failwith in
         let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
         String.Table.set current_table sym o
       end;
@@ -50,7 +50,7 @@ module Order = struct
       List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
         let sym = RespObj.string_exn o "symbol" in
-        let side = RespObj.string_exn o "side" |> buy_sell_of_bmex |> Result.ok_or_failwith in
+        let side = RespObj.string_exn o "side" |> side_of_bmex |> Result.ok_or_failwith in
         let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
         String.Table.remove current_table sym;
       end;
@@ -69,7 +69,7 @@ module Order = struct
     | Ok res -> List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
         let sym = RespObj.string_exn o "symbol" in
-        let side = RespObj.string_exn o "side" |> buy_sell_of_bmex |> Result.ok_or_failwith in
+        let side = RespObj.string_exn o "side" |> side_of_bmex |> Result.ok_or_failwith in
         let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
         String.Table.update current_table sym ~f:begin function
           | Some old_o -> RespObj.merge old_o o
