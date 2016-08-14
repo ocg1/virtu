@@ -387,17 +387,21 @@ let tickers_of_instrument ?log = function
     )
 | "ETHXBT" ->
   let open Bs_api.PLNX in
-  let evts = Ws.open_connection ~topics:[Uri.of_string "ticker"] () in
-  Pipe.filter_map evts ~f:(function
-    | Event { args } ->
-      let { Ws.symbol; bid; ask } = Ws.Msgpck.ticker_of_msgpck @@ Msgpck.List args in
-      if symbol <> to_remote_sym "ETHXBT" then None
-      else begin
-        maybe_debug log "[T] PLNX %s %f %f" symbol bid ask;
-        Some (satoshis_int_of_float_exn bid, satoshis_int_of_float_exn ask)
-      end
-    | _ -> None
-    )
+  let to_ws, to_ws_w = Pipe.create () in
+  let evts = Ws.open_connection to_ws in
+  Pipe.filter_map evts ~f:begin function
+  | Wamp.Welcome _ ->
+    don't_wait_for @@ Deferred.ignore @@ Ws.subscribe to_ws_w ["ticker"];
+    None
+  | Event { args } ->
+    let { Ws.symbol; bid; ask } = Ws.Msgpck.ticker_of_msgpck @@ Msgpck.List args in
+    if symbol <> to_remote_sym "ETHXBT" then None
+    else begin
+      maybe_debug log "[T] PLNX %s %f %f" symbol bid ask;
+      Some (satoshis_int_of_float_exn bid, satoshis_int_of_float_exn ask)
+    end
+  | _ -> None
+  end
 | _ -> invalid_arg "tickers_of_instrument"
 
 let main cfg port daemon pidfile logfile loglevel wsllevel main dry fixed remfixed instruments () =
