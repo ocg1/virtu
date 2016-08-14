@@ -1,5 +1,5 @@
 all:
-	./build simu.native virtu.byte logobs.byte
+	./build simu.byte virtu.byte logobs.byte
 
 clean:
 	./build clean
