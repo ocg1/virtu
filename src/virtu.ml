@@ -391,10 +391,10 @@ let tickers_of_instrument ?log = function
   let evts = Ws.open_connection to_ws in
   Pipe.filter_map evts ~f:begin function
   | Wamp.Welcome _ ->
-    don't_wait_for @@ Deferred.ignore @@ Ws.subscribe to_ws_w ["ticker"];
+    don't_wait_for @@ Deferred.ignore @@ Ws.Msgpck.subscribe to_ws_w ["ticker"];
     None
   | Event { args } ->
-    let { Ws.symbol; bid; ask } = Ws.Msgpck.ticker_of_msgpck @@ Msgpck.List args in
+    let { symbol; bid; ask } = Ws.Msgpck.ticker_of_msgpck @@ Msgpck.List args in
     if symbol <> to_remote_sym "ETHXBT" then None
     else begin
       maybe_debug log "[T] PLNX %s %f %f" symbol bid ask;

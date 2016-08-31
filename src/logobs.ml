@@ -96,7 +96,7 @@ module PLNX = struct
     let symbols_of_sub_ids = Int.Table.create () in
     let on_ws_msg = function
     | Wamp.Welcome _ ->
-      Ws.subscribe to_ws_w syms_polo >>| fun reqids ->
+      Ws.Msgpck.subscribe to_ws_w syms_polo >>| fun reqids ->
       symbols_of_req_ids := Option.value_exn ~message:"Ws.subscribe" (List.zip reqids symbols)
     | Subscribed { reqid; id } ->
       let sym = List.Assoc.find_exn !symbols_of_req_ids reqid in
