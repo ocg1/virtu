@@ -5,4 +5,5 @@ true : bin_annot, package(bytes), warn(-40)
 
 <*/*>: package(bs_devkit), \
        package(bs_api), \
+       package(ocamlgraph), \
        thread

@@ -5,6 +5,7 @@ PKG bs_devkit
 PKG bs_api
 PKG msgpck
 PKG wamp
+PKG ocamlgraph
 S src
 S test
 B _build/**
