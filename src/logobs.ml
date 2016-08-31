@@ -104,8 +104,9 @@ module PLNX = struct
       Int.Table.set symbols_of_sub_ids id sym;
       let db = String.Table.find_exn plnx_dbs sym in
       let rec loop () =
-        Monitor.try_with_or_error (fun () -> Rest.orderbook sym_polo) >>= function
-        | Ok { asks; bids; seq } ->
+        Monitor.try_with_or_error (fun () -> Rest.books ~symbol:sym_polo ()) >>= function
+        | Ok books ->
+          let { Rest.asks; bids; seq } = List.Assoc.find_exn books sym_polo in
           let evts = List.map (bids @ asks) ~f:(fun evt -> DB.BModify evt) in
           store db seq evts;
           info "stored %d %s partial" (List.length evts) sym;
