@@ -6,6 +6,8 @@ PKG bs_api
 PKG msgpck
 PKG wamp
 PKG ocamlgraph
+PKG ppx_hash
+PKG ppx_compare
 S src
 S test
 B _build/**

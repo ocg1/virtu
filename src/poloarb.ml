@@ -7,6 +7,113 @@ open Bs_devkit.Core
 open Bs_api.PLNX
 open Graph
 
+module CycleTbl = Hashtbl.Make (struct
+    type t = (string * float * string) list [@@deriving sexp]
+    let compare = [%compare: t]
+
+    let hash_fold_t state pairs =
+      let len = List.fold_left pairs ~init:0 ~f:begin fun a (q,_,b) ->
+          a + String.length q + String.length b
+        end
+      in
+      let state = ref (hash_fold_int state len) in
+      List.iter pairs ~f:begin fun (q,_,b) ->
+        for pos = 0 to String.length q - 1 do
+          state := hash_fold_char !state (Char.lowercase (String.unsafe_get q pos))
+        done;
+        for pos = 0 to String.length b - 1 do
+          state := hash_fold_char !state (Char.lowercase (String.unsafe_get b pos))
+        done;
+      end;
+      !state
+
+    let hash = [%hash: t]
+  end)
+
+let string_of_cycle buf cycle =
+  Buffer.clear buf;
+  let gain = List.fold_left cycle ~init:1. ~f:begin fun a (f, v, _) ->
+      Buffer.(add_string buf f; add_string buf " -> ");
+      a *. v
+    end
+  in
+  Buffer.add_string buf @@ Printf.sprintf "%.3f" gain;
+  Buffer.contents buf
+
+let string_of_cycle = string_of_cycle (Buffer.create 128)
+
+let cycles : unit CycleTbl.t = CycleTbl.create ()
+
+type entry = { qty: int; seq: int }
+type book = entry Int.Map.t
+type books = { bids: book; asks: book }
+
+let books : books String.Table.t = String.Table.create ()
+let balances : int String.Table.t = String.Table.create ()
+
+let key = ref ""
+let secret = ref @@ Cstruct.of_string ""
+
+let top_changed ~side ~oldb ~newb = match side with
+| Buy -> Int.Map.max_elt oldb <> Int.Map.max_elt newb
+| Sell -> Int.Map.min_elt oldb <> Int.Map.min_elt newb
+
+let get_entry ~symbol ~side ~price =
+  let book = String.Table.find books symbol in
+  Option.bind book ~f:begin fun { bids; asks } ->
+    Int.Map.find (match side with Buy -> bids | Sell -> asks) price
+  end
+
+let best_entry ~symbol ~side =
+  let book = String.Table.find books symbol in
+  Option.bind book ~f:begin fun { bids; asks } ->
+    match side with
+    | Buy -> Int.Map.max_elt bids
+    | Sell -> Int.Map.min_elt asks
+  end
+
+let execute_arbitrage ?(dry_run=true) ?buf cycle =
+  let inner () =
+    Deferred.List.iter cycle ~f:begin fun (quote, _, base) ->
+      let symbol = quote ^ "_" ^ base in
+      let quote_balance = String.Table.find_exn balances quote in
+      match best_entry ~symbol ~side:Buy with
+      | None -> failwithf "No orderbook for %s" symbol ()
+      | Some (price, { qty }) ->
+        let qty = Int.min qty (quote_balance / price) in
+        match dry_run with
+        | true ->
+          let q = -price * qty in
+          String.Table.incr balances quote ~by:q;
+          String.Table.incr balances base ~by:qty;
+          info "[Sim] %s (%d) -> %s (%d)" quote q base qty;
+          Deferred.unit
+        | false ->
+          Rest.order ?buf ~key:!key ~secret:!secret ~side:Buy
+            ~tif:Fill_or_kill ~symbol:base ~price ~qty  () >>| function
+          | Error err -> Error.raise err
+          | Ok { orderNumber; resultingTrades } ->
+            let trades = List.map resultingTrades ~f:trade_of_trade_raw in
+            let q, b = List.fold_left trades ~init:(0, 0) ~f:begin fun (q, b) { ts; side; price; qty } ->
+                q - price * qty, b + qty
+              end
+            in
+            String.Table.incr balances quote ~by:q;
+            String.Table.incr balances base ~by:b;
+            info "[Trade] %s (%d) -> %s (%d)" quote q base qty;
+    end
+  in
+  match CycleTbl.find cycles cycle with
+  | Some _ -> Deferred.unit
+  | None ->
+    CycleTbl.set cycles cycle ();
+    info "Processing %s" @@ string_of_cycle cycle;
+    Monitor.try_with_or_error (fun () ->
+        Monitor.protect inner ~finally:(fun () -> return @@ CycleTbl.remove cycles cycle))
+    >>| function
+    | Ok () -> info "Done processing %s" @@ string_of_cycle cycle
+    | Error err -> error "Error processing %s: %s" (string_of_cycle cycle) (Error.to_string_hum err)
+
 module G = Imperative.Digraph.ConcreteBidirectionalLabeled (String) (struct include Float let default = 0. end)
 module BF = Path.BellmanFord (G)
     (struct
@@ -21,9 +128,13 @@ module BF = Path.BellmanFord (G)
 let g = G.create ()
 type edge_list = (string * float * string) list [@@deriving sexp]
 
-let make_find_negative_cycle buf =
-  fun g symbol bid ask ->
-    let currs = ["BTC"] in
+let rec fix_cycle res = function
+| [] -> []
+| ("BTC", _, _) :: t as rest -> rest @ List.rev res
+| h::t -> fix_cycle (h :: res) t
+
+let find_negative_cycle g symbol bid ask =
+    let currs = ["BTC"; "ETH"; "XMR"] in
     match String.split symbol ~on:'_' with
     | [quote; base] ->
       G.remove_edge g quote base;
@@ -31,40 +142,12 @@ let make_find_negative_cycle buf =
       G.(add_edge_e g @@ E.create quote ((1. /. ask) *. 0.9975) base);
       G.(add_edge_e g @@ E.create base (bid *. 0.9975) quote);
       List.iter currs ~f:begin fun c -> try
-        let cycle = BF.find_negative_cycle_from g c in
-        Buffer.clear buf;
-        let gain = List.fold_left cycle ~init:1. ~f:begin fun a (f, v, _) ->
-            Buffer.(add_string buf f; add_string buf " -> ");
-            a *. v
-          end
-        in
-        Buffer.add_string buf @@ Printf.sprintf "%.3f" gain;
-        info "ARB %s" @@ Buffer.contents buf
+        let cycle = fix_cycle [] @@ BF.find_negative_cycle_from g c in
+        don't_wait_for @@ execute_arbitrage cycle;
+        info "ARB %s" @@ string_of_cycle cycle
       with Not_found -> ()
       end;
     | _ -> invalid_arg "quote_base_of_symbol"
-
-let find_negative_cycle = make_find_negative_cycle @@ Buffer.create 64
-
-type entry = { qty: int; seq: int }
-type book = entry Int.Map.t
-type books = { bids: book; asks: book }
-
-let books : books String.Table.t = String.Table.create ()
-
-let top_changed ~side ~oldb ~newb = match side with
-| Buy -> Int.Map.max_elt oldb <> Int.Map.max_elt newb
-| Sell -> Int.Map.min_elt oldb <> Int.Map.min_elt newb
-
-let get_entry ~symbol ~side ~price =
-  let { bids; asks } = String.Table.find_exn books symbol in
-  Int.Map.find (match side with Buy -> bids | Sell -> asks) price
-
-let best_entry ~symbol ~side =
-  let { bids; asks } = String.Table.find_exn books symbol in
-  match side with
-  | Buy -> Int.Map.max_elt bids
-  | Sell -> Int.Map.min_elt asks
 
 let find_negative_cycle ~symbol =
   debug "find negative cycle %s" symbol;
@@ -111,7 +194,7 @@ let del_entry side symbol ~seq ~price =
     String.Table.set books symbol { bids; asks=asks' };
     top_changed side asks asks'
 
-let ws buf ws_init =
+let ws buf ws_init ob_initialized =
   let to_ws, to_ws_w = Pipe.create () in
   let symbols_of_req_ids = ref [] in
   let symbols_of_sub_ids = Int.Table.create () in
@@ -140,12 +223,12 @@ let ws buf ws_init =
         let ({ side; price; qty } as update): DB.book_entry = book_of_msgpck data in
         debug "%d M %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
         let changed = set_entry ~symbol ~side ~seq ~price ~qty in
-        if changed then find_negative_cycle ~symbol
+        if changed && !ob_initialized then find_negative_cycle ~symbol
       | Ok { typ="orderBookRemove"; data } ->
         let ({ side; price; qty } as update): DB.book_entry = book_of_msgpck data in
         debug "%d D %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
         let changed = del_entry side symbol ~seq ~price in
-        if changed then find_negative_cycle ~symbol
+        if changed && !ob_initialized then find_negative_cycle ~symbol
       | Ok { typ } -> failwithf "unexpected message type %s" typ ()
     in
     List.iter args ~f:iter_f;
@@ -173,7 +256,8 @@ let load_books ?depth buf =
       end
     in
     String.Table.set books symbol { bids; asks }
-  end
+  end;
+  info "Loaded %d books" @@ List.length bs
 
 let update_books ?depth buf =
   Rest.books ~buf ?depth () >>| fun bs ->
@@ -183,10 +267,11 @@ let update_books ?depth buf =
     end;
     List.iter asks ~f:begin fun { side; price; qty } ->
       let (_:bool) = set_entry ~symbol ~side ~price ~qty ~seq in ()
-    end
-  end
+    end;
+  end;
+  info "Updated %d books" @@ List.length bs
 
-let main daemon pidfile logfile loglevel () =
+let main cfg daemon pidfile logfile loglevel () =
   if daemon then Daemon.daemonize ~cd:"." ();
   don't_wait_for begin
     Lock_file.create_exn pidfile >>= fun () ->
@@ -194,21 +279,34 @@ let main daemon pidfile logfile loglevel () =
     set_level (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
     let buf = Bi_outbuf.create 4096 in
     let ws_init = Ivar.create () in
+    let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> Result.ok_or_failwith in
+    let cfg = List.Assoc.find_exn cfg "PLNX" in
+    key := cfg.key;
+    secret := Cstruct.of_string cfg.secret;
     info "poloarb starting";
+    Rest.balances ~key:!key ~secret:!secret () >>= fun bs ->
+    List.iter bs ~f:begin fun (symbol, qty) ->
+      String.Table.set balances ~key:symbol ~data:(satoshis_int_of_float_exn qty)
+    end;
+    info "Loaded %d balances" @@ List.length bs;
     Rest.currencies ~buf () >>= fun currs ->
     List.iter currs ~f:(fun (c, _) -> G.add_vertex g c);
     load_books ~depth:0 buf >>= fun () ->
-    let ws_t = ws buf ws_init in
+    let ob_initialized = ref false in
+    let ws_t = ws buf ws_init ob_initialized in
     Ivar.read ws_init >>= fun () ->
     update_books buf >>= fun () ->
+    ob_initialized := true;
     ws_t
   end;
   never_returns @@ Scheduler.go ()
 
 let command =
+  let default_cfg = Filename.concat (Option.value_exn (Sys.getenv "HOME")) ".virtu" in
   let spec =
     let open Command.Spec in
     empty
+    +> flag "-cfg" (optional_with_default default_cfg string) ~doc:"path Filepath of config file (default: ~/.virtu)"
     +> flag "-daemon" no_arg ~doc:" Daemonize"
     +> flag "-pidfile" (optional_with_default "run/poloarb.pid" string) ~doc:"filename Path of the pid file (run/poloarb.pid)"
     +> flag "-logfile" (optional_with_default "log/poloarb.log" string) ~doc:"filename Path of the log file (log/poloarb.log)"
