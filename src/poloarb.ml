@@ -72,35 +72,48 @@ let best_entry ~symbol ~side =
     | Sell -> Int.Map.min_elt asks
   end
 
+let symbol_of_currs ~quote ~base = quote ^ "_" ^ base
+
 let execute_arbitrage ?(dry_run=true) ?buf cycle =
   let inner () =
-    Deferred.List.iter cycle ~f:begin fun (quote, _, base) ->
-      let symbol = quote ^ "_" ^ base in
-      let quote_balance = String.Table.find_exn balances quote in
-      match best_entry ~symbol ~side:Buy with
+    Deferred.List.iter cycle ~f:begin fun (c1, _, c2) ->
+      let symbol = symbol_of_currs c1 c2 in
+      let symbol, inverted =
+        if String.Table.mem books symbol then symbol, false else symbol_of_currs c2 c1, true
+      in
+      let side, op, invop = match inverted with
+      | false -> Sell, ( /. ), ( *. )
+      | true -> Buy, ( *. ), ( /. )
+      in
+      match best_entry ~symbol ~side with
       | None -> failwithf "No orderbook for %s" symbol ()
       | Some (price, { qty }) ->
-        let qty = Int.min qty (quote_balance / price) in
+        let c1_balance = String.Table.find_exn balances c1 // 100_000_000 in
+        let price' = price // 100_000_000 in
+        let q2 = qty // 100_000_000 in
+        let q2 = Float.min q2 (op c1_balance price') in
         match dry_run with
         | true ->
-          let q = -price * qty in
-          String.Table.incr balances quote ~by:q;
-          String.Table.incr balances base ~by:qty;
-          info "[Sim] %s (%d) -> %s (%d)" quote q base qty;
+          let q1 = -. invop price' q2 in
+          String.Table.incr balances c1 ~by:(satoshis_int_of_float_exn q1);
+          String.Table.incr balances c2 ~by:(satoshis_int_of_float_exn q2);
+          info "[Sim] %s (%f) -> %s (%f)" c1 q1 c2 q2;
           Deferred.unit
         | false ->
           Rest.order ?buf ~key:!key ~secret:!secret ~side:Buy
-            ~tif:Fill_or_kill ~symbol:base ~price ~qty  () >>| function
+            ~tif:Fill_or_kill ~symbol ~price ~qty:(satoshis_int_of_float_exn q2)  () >>| function
           | Error err -> Error.raise err
           | Ok { orderNumber; resultingTrades } ->
             let trades = List.map resultingTrades ~f:trade_of_trade_raw in
-            let q, b = List.fold_left trades ~init:(0, 0) ~f:begin fun (q, b) { ts; side; price; qty } ->
-                q - price * qty, b + qty
+            let q1, q2 = List.fold_left trades ~init:(0., 0.) ~f:begin fun (q1, q2) { ts; side; price; qty } ->
+                let price = price // 100_000_000 in
+                let qty = qty // 100_000_000 in
+                q1 -. invop price qty, q2 +. qty
               end
             in
-            String.Table.incr balances quote ~by:q;
-            String.Table.incr balances base ~by:b;
-            info "[Trade] %s (%d) -> %s (%d)" quote q base qty;
+            String.Table.incr balances c1 ~by:(satoshis_int_of_float_exn q1);
+            String.Table.incr balances c2 ~by:(satoshis_int_of_float_exn q2);
+            info "[Trade] %s (%f) -> %s (%f)" c1 q1 c2 q2;
     end
   in
   match CycleTbl.find cycles cycle with
@@ -288,6 +301,7 @@ let main cfg daemon pidfile logfile loglevel () =
     info "poloarb starting";
     Rest.balances ~key:!key ~secret:!secret () >>= fun bs ->
     List.iter bs ~f:begin fun (symbol, qty) ->
+      if symbol = "BTC" then info "%s balance %.3f mBTC" symbol @@ qty *. 1e3;
       String.Table.set balances ~key:symbol ~data:(satoshis_int_of_float_exn qty)
     end;
     info "Loaded %d balances" @@ List.length bs;
