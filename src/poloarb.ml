@@ -143,8 +143,10 @@ let find_negative_cycle g symbol bid ask =
       G.(add_edge_e g @@ E.create base (bid *. 0.9975) quote);
       List.iter currs ~f:begin fun c -> try
         let cycle = fix_cycle [] @@ BF.find_negative_cycle_from g c in
-        don't_wait_for @@ execute_arbitrage cycle;
-        info "ARB %s" @@ string_of_cycle cycle
+        if List.length cycle > 2 then begin
+          don't_wait_for @@ execute_arbitrage cycle;
+          info "ARB %s" @@ string_of_cycle cycle
+        end
       with Not_found -> ()
       end;
     | _ -> invalid_arg "quote_base_of_symbol"
