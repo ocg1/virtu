@@ -22,21 +22,13 @@ module Order = struct
   | _ -> invalid_arg "oid_of_respobj"
 
   let position cfg =
-    Monitor.try_with_or_error ~name:"Position.position" begin fun () ->
-      Rest.Position.position ?log:cfg.log
-        ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret ()
-    end
+    Rest.Position.position ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret ()
 
-  let submit cfg orders =
-    if orders = [] then invalid_arg "submit: empty orders";
-    if cfg.dry_run then
-      Deferred.Or_error.return @@
-      Printf.sprintf "[Sim] submitted %s" Yojson.Safe.(to_string @@ `List orders)
+  let submit ?buf cfg orders =
+    if orders = [] then Deferred.Or_error.error_string "submit: empty orders"
+    else if cfg.dry_run then Deferred.Or_error.return (`List orders)
     else
-    Monitor.try_with_or_error ~name:"Order.submit" begin fun () ->
-      Rest.Order.submit ?log:cfg.log
-        ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders
-    end >>| function
+    Rest.Order.submit ?buf ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders >>| function
     | Ok res ->
       List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
@@ -57,14 +49,11 @@ module Order = struct
       Error err
 
   let update cfg orders =
-    if orders = [] then invalid_arg "update: empty orders";
-    if cfg.dry_run then
-      Deferred.Or_error.return @@
-      Printf.sprintf "[Sim] updated %s" Yojson.Safe.(to_string @@ `List orders)
+    if orders = [] then Deferred.Or_error.error_string "update: empty orders"
+    else if cfg.dry_run then
+      Deferred.Or_error.return (`List orders)
     else
-    Monitor.try_with_or_error ~name:"Order.update" (fun () ->
-        Bs_api.BMEX.Rest.Order.update ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders
-      ) >>| function
+    Bs_api.BMEX.Rest.Order.update ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders  >>| function
     | Error err -> Error err
     | Ok res -> List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
@@ -82,20 +71,16 @@ module Order = struct
     if cfg.dry_run then begin
       String.Table.clear cfg.current_bids;
       String.Table.clear cfg.current_asks;
-      Deferred.Or_error.return "[Sim] canceled all orders"
+      Deferred.Or_error.return `Null
     end
     else
-    Monitor.try_with_or_error ~name:"Order.cancel_all" (fun () ->
-        Bs_api.BMEX.Rest.Order.cancel_all ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret ?symbol ?filter ()
-      )
+    Rest.Order.cancel_all ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret ?symbol ?filter ()
 
   let cancel_all_after cfg timeout =
     if cfg.dry_run then
-      Deferred.Or_error.return @@ Printf.sprintf "[Sim] cancel all after %d" timeout
+      Deferred.Or_error.return `Null
     else
-    Monitor.try_with_or_error ~name:"Order.cancel_all_after" (fun () ->
-        Bs_api.BMEX.Rest.Order.cancel_all_after ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret timeout
-      )
+    Rest.Order.cancel_all_after ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret timeout
 end
 
 type best_price_kind = Best | Vwap

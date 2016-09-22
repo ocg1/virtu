@@ -333,10 +333,14 @@ let import_positions = function
 
 let market_make strategy instruments =
   let on_ws_msg msg = match Ws.msg_of_yojson msg with
-  | Welcome -> info "WS: connected"; Deferred.unit
-  | Error msg -> error "BitMEX: error %s" msg; Deferred.unit
-  | Ok { request = { op = "subscribe" }; subscribe; success } -> info "BitMEX: subscribed to %s: %b" subscribe success; Deferred.unit
-  | Ok { success } -> error "BitMEX: unexpected response %s" (Yojson.Safe.to_string msg); Deferred.unit
+  | Welcome ->
+    info "WS: connected"; Deferred.unit
+  | Error err ->
+    error "BitMEX: error %s" @@ Ws.show_error err; Deferred.unit
+  | Ok { request = { op = "subscribe" }; subscribe; success } ->
+    info "BitMEX: subscribed to %s: %b" subscribe success; Deferred.unit
+  | Ok { success } ->
+    error "BitMEX: unexpected response %s" (Yojson.Safe.to_string msg); Deferred.unit
   | Update { table; action; data } ->
     let action = update_action_of_string action in
     match table with
@@ -359,7 +363,7 @@ let market_make strategy instruments =
   Deferred.Or_error.ok_exn (Order.cancel_all !order_cfg) >>= fun _str ->
   info "all orders canceled";
   Deferred.Or_error.ok_exn (Order.position !order_cfg) >>= fun ps ->
-  import_positions (Yojson.Safe.from_string ps);
+  import_positions ps;
   info "positions imported";
   let topics = List.(map instruments ~f:(fun i -> ["execution"; "instrument:" ^ i; "orderBookL2:" ^ i]) |> concat) in
   don't_wait_for @@ dead_man's_switch 60000 15;
@@ -381,7 +385,7 @@ let market_make strategy instruments =
 let tickers_of_instrument ?log = function
 | "XBTUSD" ->
   Pipe.map (Ws.Kaiko.tickers ["bitmex"]) ~f:(fun { index={ bid; ask } } ->
-      maybe_debug log "[T] Kaiko %s %s" bid ask;
+      Option.iter log ~f:(fun log -> Log.debug log "[T] Kaiko %s %s" bid ask);
       satoshis_int_of_float_exn @@ Float.of_string bid,
       satoshis_int_of_float_exn @@ Float.of_string ask
     )
@@ -397,7 +401,7 @@ let tickers_of_instrument ?log = function
     let { symbol; bid; ask } = Ws.Msgpck.ticker_of_msgpck @@ Msgpck.List args in
     if symbol <> to_remote_sym "ETHXBT" then None
     else begin
-      maybe_debug log "[T] PLNX %s %f %f" symbol bid ask;
+      Option.iter log ~f:(fun log -> Log.debug log "[T] PLNX %s %f %f" symbol bid ask);
       Some (satoshis_int_of_float_exn bid, satoshis_int_of_float_exn ask)
     end
   | _ -> None

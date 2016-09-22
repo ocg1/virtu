@@ -100,20 +100,17 @@ let execute_arbitrage ?(dry_run=true) ?buf cycle =
           info "[Sim] %s (%f) -> %s (%f)" c1 q1 c2 q2;
           Deferred.unit
         | false ->
-          Rest.order ?buf ~key:!key ~secret:!secret ~side:Buy
-            ~tif:Fill_or_kill ~symbol ~price ~qty:(satoshis_int_of_float_exn q2)  () >>| function
-          | Error err -> Error.raise err
-          | Ok { orderNumber; resultingTrades } ->
-            let trades = List.map resultingTrades ~f:trade_of_trade_raw in
-            let q1, q2 = List.fold_left trades ~init:(0., 0.) ~f:begin fun (q1, q2) { ts; side; price; qty } ->
-                let price = price // 100_000_000 in
-                let qty = qty // 100_000_000 in
-                q1 -. invop price qty, q2 +. qty
-              end
-            in
-            String.Table.incr balances c1 ~by:(satoshis_int_of_float_exn q1);
-            String.Table.incr balances c2 ~by:(satoshis_int_of_float_exn q2);
-            info "[Trade] %s (%f) -> %s (%f)" c1 q1 c2 q2;
+          Deferred.Or_error.ok_exn (Rest.order ?buf ~key:!key ~secret:!secret ~side:Buy
+                                      ~tif:Fill_or_kill ~symbol ~price ~qty:(satoshis_int_of_float_exn q2) ()) >>| fun { id; trades; amount_unfilled } ->
+          let q1, q2 = List.fold_left trades ~init:(0., 0.) ~f:begin fun (q1, q2) { gid; id; trade={ ts; side; price; qty } } ->
+              let price = price // 100_000_000 in
+              let qty = qty // 100_000_000 in
+              q1 -. invop price qty, q2 +. qty
+            end
+          in
+          String.Table.incr balances c1 ~by:(satoshis_int_of_float_exn q1);
+          String.Table.incr balances c2 ~by:(satoshis_int_of_float_exn q2);
+          info "[Trade] %s (%f) -> %s (%f)" c1 q1 c2 q2;
     end
   in
   match CycleTbl.find cycles cycle with
@@ -258,24 +255,24 @@ let ws buf ws_init ob_initialized =
     (fun exn -> error "%s" @@ Exn.to_string exn)
 
 let load_books ?depth buf =
-  Rest.books ~buf ?depth () >>| fun bs ->
-  List.iter bs ~f:begin fun (symbol, { asks; bids; isFrozen; seq }) ->
-    let bids =
-      List.fold_left bids ~init:Int.Map.empty ~f:begin fun a { side; price; qty } ->
-        Int.Map.add a ~key:price ~data:{ qty; seq }
-      end
-    in
-    let asks =
-      List.fold_left asks ~init:Int.Map.empty ~f:begin fun a { side; price; qty } ->
-        Int.Map.add a ~key:price ~data:{ qty; seq }
-      end
-    in
-    String.Table.set books symbol { bids; asks }
-  end;
-  info "Loaded %d books" @@ List.length bs
+  Deferred.Or_error.ok_exn (Rest.books ~buf ?depth ()) >>| fun bs ->
+    List.iter bs ~f:begin fun (symbol, { asks; bids; isFrozen; seq }) ->
+      let bids =
+        List.fold_left bids ~init:Int.Map.empty ~f:begin fun a { side; price; qty } ->
+          Int.Map.add a ~key:price ~data:{ qty; seq }
+        end
+      in
+      let asks =
+        List.fold_left asks ~init:Int.Map.empty ~f:begin fun a { side; price; qty } ->
+          Int.Map.add a ~key:price ~data:{ qty; seq }
+        end
+      in
+      String.Table.set books symbol { bids; asks }
+    end;
+    info "Loaded %d books" @@ List.length bs
 
 let update_books ?depth buf =
-  Rest.books ~buf ?depth () >>| fun bs ->
+  Deferred.Or_error.ok_exn (Rest.books ~buf ?depth ()) >>| fun bs ->
   List.iter bs ~f:begin fun (symbol, { asks; bids; isFrozen; seq }) ->
     List.iter bids ~f:begin fun { side; price; qty } ->
       let (_:bool) = set_entry ~symbol ~side ~price ~qty ~seq in ()
@@ -299,13 +296,13 @@ let main cfg daemon pidfile logfile loglevel () =
     key := cfg.key;
     secret := Cstruct.of_string cfg.secret;
     info "poloarb starting";
-    Rest.balances ~key:!key ~secret:!secret () >>= fun bs ->
-    List.iter bs ~f:begin fun (symbol, qty) ->
-      if symbol = "BTC" then info "%s balance %.3f mBTC" symbol @@ qty *. 1e3;
-      String.Table.set balances ~key:symbol ~data:(satoshis_int_of_float_exn qty)
+    Deferred.Or_error.ok_exn (Rest.balances ~buf ~key:!key ~secret:!secret ()) >>= fun bs ->
+    List.iter bs ~f:begin fun (symbol, { available; on_orders; btc_value }) ->
+      if symbol = "BTC" then info "%s balance %d XBt" symbol available;
+      String.Table.set balances ~key:symbol ~data:available
     end;
     info "Loaded %d balances" @@ List.length bs;
-    Rest.currencies ~buf () >>= fun currs ->
+    Deferred.Or_error.ok_exn (Rest.currencies ~buf ()) >>= fun currs ->
     List.iter currs ~f:(fun (c, _) -> G.add_vertex g c);
     load_books ~depth:0 buf >>= fun () ->
     let ob_initialized = ref false in
