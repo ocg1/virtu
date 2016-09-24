@@ -144,22 +144,22 @@ let rec fix_cycle res = function
 | h::t -> fix_cycle (h :: res) t
 
 let find_negative_cycle g symbol bid ask =
-    let currs = ["BTC"; "ETH"; "XMR"] in
-    match String.split symbol ~on:'_' with
-    | [quote; base] ->
-      G.remove_edge g quote base;
-      G.remove_edge g base quote;
-      G.(add_edge_e g @@ E.create quote ((1. /. ask) *. !fees) base);
-      G.(add_edge_e g @@ E.create base (bid *. !fees) quote);
-      List.iter currs ~f:begin fun c -> try
-        let cycle = fix_cycle [] @@ BF.find_negative_cycle_from g c in
-        if List.length cycle > 2 then begin
-          don't_wait_for @@ execute_arbitrage cycle;
-          info "ARB %s" @@ string_of_cycle cycle
-        end
-      with Not_found -> ()
-      end;
-    | _ -> invalid_arg "quote_base_of_symbol"
+  let currs = ["BTC"; "ETH"; "XMR"] in
+  match String.split symbol ~on:'_' with
+  | [quote; base] ->
+    G.remove_edge g quote base;
+    G.remove_edge g base quote;
+    G.(add_edge_e g @@ E.create quote ((1. /. ask) *. !fees) base);
+    G.(add_edge_e g @@ E.create base (bid *. !fees) quote);
+    List.iter currs ~f:begin fun c -> try
+      let cycle = fix_cycle [] @@ BF.find_negative_cycle_from g c in
+      if List.length cycle > 2 then begin
+        don't_wait_for @@ execute_arbitrage cycle;
+        info "ARB %s" @@ string_of_cycle cycle
+      end
+    with Not_found -> ()
+    end;
+  | _ -> invalid_arg "quote_base_of_symbol"
 
 let find_negative_cycle ~symbol =
   debug "find negative cycle %s" symbol;
@@ -256,20 +256,20 @@ let ws buf ws_init ob_initialized =
 
 let load_books ?depth buf =
   Deferred.Or_error.ok_exn (Rest.books ~buf ?depth ()) >>| fun bs ->
-    List.iter bs ~f:begin fun (symbol, { asks; bids; isFrozen; seq }) ->
-      let bids =
-        List.fold_left bids ~init:Int.Map.empty ~f:begin fun a { side; price; qty } ->
-          Int.Map.add a ~key:price ~data:{ qty; seq }
-        end
-      in
-      let asks =
-        List.fold_left asks ~init:Int.Map.empty ~f:begin fun a { side; price; qty } ->
-          Int.Map.add a ~key:price ~data:{ qty; seq }
-        end
-      in
-      String.Table.set books symbol { bids; asks }
-    end;
-    info "Loaded %d books" @@ List.length bs
+  List.iter bs ~f:begin fun (symbol, { asks; bids; isFrozen; seq }) ->
+    let bids =
+      List.fold_left bids ~init:Int.Map.empty ~f:begin fun a { side; price; qty } ->
+        Int.Map.add a ~key:price ~data:{ qty; seq }
+      end
+    in
+    let asks =
+      List.fold_left asks ~init:Int.Map.empty ~f:begin fun a { side; price; qty } ->
+        Int.Map.add a ~key:price ~data:{ qty; seq }
+      end
+    in
+    String.Table.set books symbol { bids; asks }
+  end;
+  info "Loaded %d books" @@ List.length bs
 
 let update_books ?depth buf =
   Deferred.Or_error.ok_exn (Rest.books ~buf ?depth ()) >>| fun bs ->
