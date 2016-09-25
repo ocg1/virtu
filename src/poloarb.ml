@@ -44,12 +44,17 @@ type entry = { qty: int; seq: int }
 type book = entry Int.Map.t
 type books = { bids: book; asks: book }
 
+let arbitrable_symbols = ref String.Set.empty
 let books : books String.Table.t = String.Table.create ()
 let balances : Float.t String.Table.t = String.Table.create ()
+
+type vwap = { bid: float; bid_qty: int; ask: float; ask_qty: int } [@@deriving create]
+let vwaps : vwap String.Table.t = String.Table.create ()
 
 let key = ref ""
 let secret = ref @@ Cstruct.of_string ""
 let fees = ref Float.one
+let threshold = ref 0
 
 let top_changed ~side ~oldb ~newb = match side with
 | Buy -> Int.Map.max_elt oldb <> Int.Map.max_elt newb
@@ -69,7 +74,46 @@ let best_entry ~symbol ~side =
     | Sell -> Int.Map.min_elt asks
   end
 
+exception Result of float * int
+let return_result ~qty ~vwap = raise (Result (vwap, qty))
+
+let vwap ~symbol ~side ~threshold =
+  let fold_f_exn ~threshold ~key:price ~data:{ qty } (vwap, oldq) =
+    (* info "vwap %s %d %d %d %f %d" symbol price qty oldq vwap threshold; *)
+    let pricef = price // 100_000_000 in
+    if oldq + qty <= threshold
+    then
+      let qtyf = qty // 100_000_000 in
+      vwap +. pricef *. qtyf, oldq + qty
+    else
+    let rem_qty = threshold - oldq in
+    let rem_qtyf = rem_qty // 100_000_000 in
+    return_result ~qty:(oldq + rem_qty) ~vwap:(vwap +. pricef *. rem_qtyf)
+  in
+  let open Option.Monad_infix in
+  best_entry ~symbol ~side >>= fun (price, _qty) ->
+  let threshold = ((threshold // price) *. 1e8) |> Int.of_float in
+  String.Table.find books symbol >>| fun { bids; asks } ->
+  match side with
+  | Buy -> begin try
+      Int.Map.fold_right bids ~init:(0., 0) ~f:(fold_f_exn ~threshold)
+    with Result (vwap, q) -> (vwap, q)
+    end
+  | Sell -> begin try
+      Int.Map.fold asks ~init:(0., 0) ~f:(fold_f_exn ~threshold)
+    with Result (vwap, q) -> (vwap, q)
+    end
+
 let symbol_of_currs ~quote ~base = quote ^ "_" ^ base
+
+type symbol = { quote: string; base: string } [@@deriving create]
+
+let currs : symbol String.Table.t = String.Table.create ()
+
+let currs_of_symbol sym =
+  match String.split sym ~on:'_' with
+  | [quote; base] -> create_symbol ~quote ~base ()
+  | _ -> invalid_argf "currs_of_symbol: %s" sym ()
 
 let execute_arbitrage ?(dry_run=true) ?buf cycle =
   let iter_f (c1, _, c2) =
@@ -78,14 +122,13 @@ let execute_arbitrage ?(dry_run=true) ?buf cycle =
       if String.Table.mem books symbol then symbol, false else symbol_of_currs c2 c1, true
     in
     let side = if inverted then Buy else Sell in
-    match best_entry ~symbol ~side with
-    | None -> failwithf "No orderbook for %s" symbol ()
-    | Some (price, { qty }) ->
-      let pricef = price // 100_000_000 in
-      let qtyf = qty // 100_000_000 in
+    match String.Table.find vwaps symbol with
+    | None -> failwithf "No vwaps for %s" symbol ()
+    | Some { bid; bid_qty; ask; ask_qty } ->
+      let price, qty = match side with Buy -> bid, bid_qty // 100_000_000 | Sell -> ask, ask_qty // 100_000_000 in
       let c1_balance = String.Table.find_exn balances c1 in
-      let pricef' = if inverted then 1. /. pricef else pricef in
-      let q2 = if inverted then qtyf *. pricef else qtyf in
+      let pricef' = if inverted then 1. /. price else price in
+      let q2 = if inverted then qty *. price else qty in
       let q2 = Float.min q2 (c1_balance /. pricef') in
       match dry_run with
       | true ->
@@ -99,7 +142,7 @@ let execute_arbitrage ?(dry_run=true) ?buf cycle =
         Deferred.unit
       | false ->
         Rest.order ?buf ~key:!key ~secret:!secret ~side:Buy
-          ~tif:Fill_or_kill ~symbol ~price ~qty:(satoshis_int_of_float_exn q2) () >>| fun res ->
+          ~tif:Fill_or_kill ~symbol ~price:(satoshis_int_of_float_exn price) ~qty:(satoshis_int_of_float_exn q2) () >>| fun res ->
         let { Rest.id; trades; amount_unfilled } = Or_error.ok_exn res in
         let q1, q2 = List.fold_left trades ~init:(0., 0.) ~f:begin fun (q1, q2) { gid; id; trade={ ts; side; price; qty } } ->
             let price = price // 100_000_000 in
@@ -143,31 +186,32 @@ let rec fix_cycle res = function
 | ("BTC", _, _) :: t as rest -> rest @ List.rev res
 | h::t -> fix_cycle (h :: res) t
 
-let find_negative_cycle g symbol bid ask =
-  let currs = ["BTC"; "ETH"; "XMR"] in
-  match String.split symbol ~on:'_' with
-  | [quote; base] ->
-    G.remove_edge g quote base;
-    G.remove_edge g base quote;
-    G.(add_edge_e g @@ E.create quote ((1. /. ask) *. !fees) base);
-    G.(add_edge_e g @@ E.create base (bid *. !fees) quote);
-    List.iter currs ~f:begin fun c -> try
-      let cycle = fix_cycle [] @@ BF.find_negative_cycle_from g c in
-      if List.length cycle > 2 then begin
-        don't_wait_for @@ execute_arbitrage cycle;
-        info "ARB %s" @@ string_of_cycle cycle
-      end
-    with Not_found -> ()
-    end;
-  | _ -> invalid_arg "quote_base_of_symbol"
+let find_negative_cycle g ~symbol ~bid ~ask =
+  let { quote; base } = String.Table.find_exn currs symbol in
+  debug "find_negative_cycle %s %f %f" symbol bid ask;
+  G.remove_edge g quote base;
+  G.remove_edge g base quote;
+  G.(add_edge_e g @@ E.create quote ((1. /. ask) *. !fees) base);
+  G.(add_edge_e g @@ E.create base (bid *. !fees) quote);
+  List.iter ["BTC"; "ETH"; "XMR"] ~f:begin fun c -> try
+    let cycle = fix_cycle [] @@ BF.find_negative_cycle_from g c in
+    if List.length cycle > 2 then begin
+      don't_wait_for @@ execute_arbitrage cycle;
+      info "ARB %s" @@ string_of_cycle cycle
+    end
+  with Not_found -> ()
+  end
 
-let find_negative_cycle ~symbol =
-  debug "find negative cycle %s" symbol;
-  let best_bid = best_entry ~symbol ~side:Buy in
-  let best_ask = best_entry ~symbol ~side:Sell in
-  match best_bid, best_ask with
-  | Some (bb,_), Some (ba,_) ->
-    find_negative_cycle g symbol (bb // 100_000_000) (ba // 100_000_000)
+let find_negative_cycle ~symbol ~threshold =
+  let bid = vwap ~symbol ~side:Buy ~threshold in
+  let ask = vwap ~symbol ~side:Sell ~threshold in
+  match bid, ask with
+  | Some (bpaid, bqty), Some (apaid, aqty) ->
+    let bvwap = bpaid /. (bqty // 100_000_000) in
+    let avwap = apaid /. (aqty // 100_000_000) in
+    (* info "find_negative_cycle: %s %f %d %f %d %f %f" symbol bpaid bqty apaid aqty bvwap avwap; *)
+    String.Table.set vwaps ~key:symbol ~data:(create_vwap ~bid:bpaid ~bid_qty:bqty ~ask:apaid ~ask_qty:aqty ());
+    find_negative_cycle g ~symbol ~bid:bvwap ~ask:avwap
   | _ -> ()
 
 let set_entry ~symbol ~side ~seq ~price ~qty =
@@ -223,6 +267,8 @@ let ws buf ws_init ob_initialized =
     Deferred.unit
   | Event { Wamp.pubid; subid; details; args; kwArgs } ->
     let symbol = Int.Table.find_exn symbols_of_sub_ids subid in
+    let { quote; base } = String.Table.find_exn currs symbol in
+    if not @@ String.Set.mem !arbitrable_symbols base then Deferred.unit else
     let seq = match List.Assoc.find_exn kwArgs "seq" with Msgpck.Int i -> i | _ -> failwith "seq" in
     let iter_f msg =
       let open Ws.Msgpck in
@@ -230,17 +276,17 @@ let ws buf ws_init ob_initialized =
       | Error msg -> failwith msg
       | Ok { typ="newTrade"; data } ->
         let trade = trade_of_msgpck data in
-        debug "%d T %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_trade trade;
+        debug "%s %d T %s" symbol seq @@ Fn.compose Sexp.to_string DB.sexp_of_trade trade;
       | Ok { typ="orderBookModify"; data } ->
         let ({ side; price; qty } as update): DB.book_entry = book_of_msgpck data in
-        debug "%d M %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
-        let changed = set_entry ~symbol ~side ~seq ~price ~qty in
-        if changed && !ob_initialized then find_negative_cycle ~symbol
+        debug "%s %d M %s" symbol seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
+        let _changed = set_entry ~symbol ~side ~seq ~price ~qty in
+        if !ob_initialized then find_negative_cycle ~symbol ~threshold:!threshold
       | Ok { typ="orderBookRemove"; data } ->
         let ({ side; price; qty } as update): DB.book_entry = book_of_msgpck data in
-        debug "%d D %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
-        let changed = del_entry side symbol ~seq ~price in
-        if changed && !ob_initialized then find_negative_cycle ~symbol
+        debug "%s %d D %s" symbol seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
+        let _changed = del_entry side symbol ~seq ~price in
+        if !ob_initialized then find_negative_cycle ~symbol ~threshold:!threshold
       | Ok { typ } -> failwithf "unexpected message type %s" typ ()
     in
     List.iter args ~f:iter_f;
@@ -283,7 +329,27 @@ let update_books ?depth buf =
   end;
   info "Updated %d books" @@ List.length bs
 
-let main cfg daemon pidfile logfile loglevel fees' () =
+let select_vertices syms =
+  let btc, eth, xmr, usdt =
+    List.fold_left syms ~init:String.Set.(empty, empty, empty, empty) ~f:begin fun (btc, eth, xmr, usdt) sym ->
+      let ({ quote; base } as c) = currs_of_symbol sym in
+      String.Table.set currs sym c;
+      match quote with
+      | "BTC" -> String.Set.add btc base, eth, xmr, usdt
+      | "ETH" -> btc, String.Set.add eth base, xmr, usdt
+      | "XMR" -> btc, eth, String.Set.add xmr base, usdt
+      | "USDT" -> btc, eth, xmr, String.Set.add usdt base
+      | _ -> invalid_arg "unknown quote currency"
+    end
+  in
+  let init = String.Set.of_list ["BTC"; "ETH"; "XMR"; "USDT"] in
+  let init = String.Set.fold btc ~init ~f:(fun a c -> if String.Set.(mem eth c || mem xmr c || mem usdt c) then String.Set.add a c else a) in
+  let init = String.Set.fold eth ~init ~f:(fun a c -> if String.Set.(mem xmr c || mem usdt c || mem btc c) then String.Set.add a c else a) in
+  let init = String.Set.fold xmr ~init ~f:(fun a c -> if String.Set.(mem usdt c || mem btc c || mem eth c) then String.Set.add a c else a) in
+  String.Set.fold usdt ~init ~f:(fun a c -> if String.Set.(mem btc c || mem eth c || mem xmr c) then String.Set.add a c else a)
+
+let main cfg daemon pidfile logfile loglevel fees' min_qty () =
+  threshold := min_qty;
   fees := 1. -. fees' // 10_000;
   if daemon then Daemon.daemonize ~cd:"." ();
   don't_wait_for begin
@@ -303,8 +369,11 @@ let main cfg daemon pidfile logfile loglevel fees' () =
       String.Table.set balances ~key:symbol ~data:(available // 100_000_000)
     end;
     info "Loaded %d balances" @@ List.length bs;
-    Deferred.Or_error.ok_exn (Rest.currencies ~buf ()) >>= fun currs ->
-    List.iter currs ~f:(fun (c, _) -> G.add_vertex g c);
+    Deferred.Or_error.ok_exn (Rest.symbols ~buf ()) >>= fun syms ->
+    let vs = select_vertices syms in
+    arbitrable_symbols := vs;
+    info "Currencies %s" (String.Set.sexp_of_t vs |> Sexplib.Sexp.to_string);
+    String.Set.iter vs ~f:(G.add_vertex g);
     load_books ~depth:0 buf >>= fun () ->
     let ob_initialized = ref false in
     let ws_t = ws buf ws_init ob_initialized in
@@ -325,7 +394,8 @@ let command =
     +> flag "-pidfile" (optional_with_default "run/poloarb.pid" string) ~doc:"filename Path of the pid file (run/poloarb.pid)"
     +> flag "-logfile" (optional_with_default "log/poloarb.log" string) ~doc:"filename Path of the log file (log/poloarb.log)"
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
-    +> flag "-fees" (optional_with_default 25 int) ~doc:"float fees in bps"
+    +> flag "-fees" (optional_with_default 25 int) ~doc:"bps fees (default: 25)"
+    +> flag "-min-qty" (optional_with_default 50_000_000 int) ~doc:"sats Min qty to arbitrage (default: 0.5 XBT)"
   in
   Command.basic ~summary:"Poloniex arbitrageur" spec main
 
