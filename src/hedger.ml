@@ -1,11 +1,11 @@
 (* Automatically hedge your BitMEX positions on Bitfinex/Poloniex *)
 
-open Core.Std
-open Async.Std
+open Core
+open Async
 open Log.Global
 
-open Util
-open Bs_devkit.Core
+open Virtu_util
+open Bs_devkit
 open Bs_api
 
 let log_bfx = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
@@ -28,13 +28,13 @@ let bfx_bids : (Int.t Int.Map.t) String.Table.t = String.Table.create ()
 let bfx_asks : (Int.t Int.Map.t) String.Table.t = String.Table.create ()
 
 let bfx_book side symbol =
-  String.Table.find (match side with Side.Bid -> bfx_bids | Ask -> bfx_asks) symbol
+  String.Table.find (match side with `Buy -> bfx_bids | `Sell -> bfx_asks) symbol
 
 let bfx_bid_vwaps : (int * int) String.Table.t = String.Table.create ()
 let bfx_ask_vwaps : (int * int) String.Table.t = String.Table.create ()
 
 let bfx_vwaps side symbol =
-  String.Table.find (match side with Side.Bid -> bfx_bid_vwaps | Ask -> bfx_ask_vwaps) symbol
+  String.Table.find (match side with `Buy -> bfx_bid_vwaps | `Sell -> bfx_ask_vwaps) symbol
 
 let tickups_w = ref None
 
@@ -67,18 +67,21 @@ let compute_vwaps sym side vwaps old_book new_book =
   let new_vp, total_v = vwap ?vlimit side new_book in
   let new_vwap = try new_vp / total_v with Division_by_zero -> 0 in
   String.Table.set vwaps sym (new_vwap, total_v);
-  let best_elt_f = Int.Map.(match side with Side.Bid -> max_elt | Ask -> min_elt) in
+  let best_elt_f = Int.Map.(match side with `Buy -> max_elt | `Sell -> min_elt) in
   let old_best_elt = Option.map ~f:fst @@ best_elt_f old_book in
   let new_best_elt = Option.map ~f:fst @@ best_elt_f new_book in
   begin match old_best_elt, new_best_elt, old_vwap with
   | Some old_best, Some new_best, Some (old_vwap, _) when old_best <> new_best || old_vwap <> new_vwap ->
-    if old_best <> new_best then Log.debug log_bfx "-> tickup %s %s %d %d" sym (Side.sexp_of_t side |> Sexp.to_string) (new_best / 1_000_000) (new_vwap / 1_000_000);
-    Option.iter !tickups_w ~f:(fun p ->
-        (try
-          Pipe.write_without_pushback p @@
-          Protocols.OrderBook.(Ticker (create_ticker ~symbol:sym ~side ~best:new_best ~vwap:new_vwap ()));
-        with _ -> tickups_w := None);
-      )
+    if old_best <> new_best then
+      Log.debug log_bfx "-> tickup %s %s %d %d"
+        sym (Side.to_bitmex_string side)
+        (new_best / 1_000_000) (new_vwap / 1_000_000);
+    Option.iter !tickups_w ~f:begin fun p -> try
+      let open Protocols.OrderBook in
+      let ticker = { symbol = sym ; side ; best = new_best ; vwap = new_vwap } in
+      Pipe.write_without_pushback p (Ticker ticker);
+    with _ -> tickups_w := None
+    end
   | _ -> ()
   end
 
@@ -86,8 +89,8 @@ let on_bfx_book_update sym { BFX.Ws.Book.Raw.id; price = new_price; amount = new
   let orders = String.Table.find_exn bfx_orders sym in
   let side, books, vwaps = match Float.sign_exn new_qty with
     | Zero -> invalid_arg "on_book_update"
-    | Pos -> Side.Bid, bfx_bids, bfx_bid_vwaps
-    | Neg -> Ask, bfx_asks, bfx_ask_vwaps
+    | Pos -> `Buy, bfx_bids, bfx_bid_vwaps
+    | Neg -> `Sell, bfx_asks, bfx_ask_vwaps
   in
   let new_price, new_qty = if new_price = 0. then None, None else
       Some (satoshis_int_of_float_exn new_price),
@@ -116,11 +119,10 @@ let subscribe_r, subscribe_w = Pipe.create ()
 
 let bfx_ws buf =
   let open BFX in
-  let on_ws_msg msg_str =
+  let on_ws_msg msg =
     let now = Time_ns.now () in
-    let msg = Yojson.Safe.from_string ~buf msg_str in
     match Ws.Ev.of_yojson msg with
-    | {Ws.Ev.name = "subscribed"; fields } ->
+    | Ok {Ws.Ev.name = "subscribed"; fields } ->
       let channel = String.Map.find_exn fields "channel" in
       let pair = String.Map.find_exn fields "pair" in
       let chanId = String.Map.find_exn fields "chanId" in
@@ -136,8 +138,8 @@ let bfx_ws buf =
         | #Yojson.Safe.json, #Yojson.Safe.json, #Yojson.Safe.json ->
           invalid_arg "wrong subscribed msg received"
       end
-    | { Ws.Ev.name; fields } -> ()
-    | exception (Invalid_argument _) ->
+    | Ok { Ws.Ev.name; fields } -> ()
+    | Error _ ->
       match Ws.Msg.of_yojson msg with
       | { Ws.Msg.chan; msg = [`String "hb"] } -> bfx_hb := now
       | { chan = 0; msg = (`String typ) :: tl } -> begin
@@ -180,7 +182,10 @@ let bfx_ws buf =
           end
         | _ -> ()
   in
-  let ws = Ws.open_connection ~log:(Lazy.force log) ~auth:(!bfx_key, !bfx_secret) ~to_ws:subscribe_r () in
+  let ws = Ws.open_connection
+      ~log:(Lazy.force log)
+      ~auth:(!bfx_key, !bfx_secret)
+      ~to_ws:subscribe_r () in
   Monitor.handle_errors
     (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
     (fun exn -> error "%s" @@ Exn.to_string exn)
@@ -200,8 +205,8 @@ let subscribe sym xbt_v =
 
 let push_initial_tickers w side symbol =
   let best_f = match side with
-  | Side.Bid -> Int.Map.max_elt
-  | Ask -> Int.Map.min_elt
+  | `Buy -> Int.Map.max_elt
+  | `Sell -> Int.Map.min_elt
   in
   let infos =
     let open Option.Monad_infix in
@@ -209,10 +214,10 @@ let push_initial_tickers w side symbol =
     bfx_vwaps side symbol >>= fun (vwap, _) ->
     best_f book >>| fun best -> fst best, vwap
   in
-  Option.iter infos ~f:(fun (best, vwap) ->
-      Pipe.write_without_pushback w @@
-      Protocols.OrderBook.(Ticker (create_ticker ~symbol ~side ~best ~vwap ()));
-    )
+  Option.iter infos ~f:begin fun (best, vwap) ->
+    let ticker = { Protocols.OrderBook.symbol ; side ; best ; vwap } in
+    Pipe.write_without_pushback w (Protocols.OrderBook.Ticker ticker);
+  end
 
 let rpc_server port =
   let module P = Protocols in
@@ -232,8 +237,8 @@ let rpc_server port =
       Option.iter !tickups_w ~f:Pipe.close;
       let r, w = Pipe.create () in
       List.iter symbols ~f:(fun (s, _) ->
-          push_initial_tickers w Side.Bid s;
-          push_initial_tickers w Side.Ask s
+          push_initial_tickers w `Buy s;
+          push_initial_tickers w `Sell s
         );
       tickups_w := Some w;
       Deferred.Or_error.return r
@@ -260,8 +265,11 @@ let rpc_server port =
 let main cfg port daemon pidfile logfile loglevel instruments () =
   don't_wait_for begin
     Lock_file.create_exn pidfile >>= fun () ->
-    let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> Result.ok_or_failwith in
-    let { Cfg.key; secret } = List.Assoc.find_exn cfg "BFX" in
+    let cfg = begin match Sexplib.Sexp.load_sexp_conv cfg Cfg.t_of_sexp with
+    | `Error (exn, _) -> raise exn
+    | `Result cfg -> cfg
+    end in
+    let { Cfg.key; secret } = List.Assoc.find_exn ~equal:String.(=) cfg "BFX" in
     bfx_key := key;
     bfx_secret := Cstruct.of_string secret;
     let buf = Bi_outbuf.create 4096 in

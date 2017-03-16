@@ -1,20 +1,41 @@
-open Core.Std
-open Async.Std
+open Core
+open Async
 
-open Dtc
-open Bs_devkit.Core
+(* open Dtc *)
+open Bs_devkit
 open Bs_api.BMEX
+
+module Side = struct
+  type t = [`Buy | `Sell]
+
+  let to_bitmex_string = function
+  | `Buy -> "Buy"
+  | `Sell -> "Sell"
+
+  let pp_bitmex ppf side =
+    Format.fprintf ppf "%s" (to_bitmex_string side)
+end
 
 module Order = struct
   type cfg = {
-    dry_run: bool [@default false];
-    current_bids: RespObj.t String.Table.t [@default String.Table.create ()];
-    current_asks: RespObj.t String.Table.t [@default String.Table.create ()];
-    testnet: bool [@default true];
-    key: string [@default ""];
-    secret: Cstruct.t [@default Cstruct.of_string ""];
-    log: Log.t option;
-  } [@@deriving create]
+    dry_run: bool ;
+    current_bids: RespObj.t String.Table.t ;
+    current_asks: RespObj.t String.Table.t ;
+    testnet: bool ;
+    key: string ;
+    secret: Cstruct.t ;
+    log: Log.t option ;
+  }
+
+  let create_cfg
+      ?(dry_run=false)
+      ?(current_bids=String.Table.create ())
+      ?(current_asks=String.Table.create ())
+      ?(testnet=true)
+      ?(key="")
+      ?(secret=Cstruct.of_string "")
+      ?log () =
+    { dry_run ; current_bids ; current_asks ; testnet ; key ; secret ; log }
 
   let oid_of_respobj o = match RespObj.(string o "clOrdID", string o "orderID") with
   | Some clOrdID, _ when clOrdID <> "" -> `C, clOrdID
@@ -33,8 +54,8 @@ module Order = struct
       List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
         let sym = RespObj.string_exn o "symbol" in
-        let side = RespObj.string_exn o "side" |> side_of_bmex |> Result.ok_or_failwith in
-        let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
+        let side = Option.value_exn (RespObj.string_exn o "side" |> side_of_bmex) in
+        let current_table = match side with `Buy -> cfg.current_bids | `Sell -> cfg.current_asks in
         String.Table.set current_table sym o
       end;
       Ok res
@@ -42,8 +63,8 @@ module Order = struct
       List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
         let sym = RespObj.string_exn o "symbol" in
-        let side = RespObj.string_exn o "side" |> side_of_bmex |> Result.ok_or_failwith in
-        let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
+        let side = Option.value_exn (RespObj.string_exn o "side" |> side_of_bmex) in
+        let current_table = match side with `Buy -> cfg.current_bids | `Sell -> cfg.current_asks in
         String.Table.remove current_table sym;
       end;
       Error err
@@ -58,8 +79,8 @@ module Order = struct
     | Ok res -> List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
         let sym = RespObj.string_exn o "symbol" in
-        let side = RespObj.string_exn o "side" |> side_of_bmex |> Result.ok_or_failwith in
-        let current_table = match side with Buy -> cfg.current_bids | Sell -> cfg.current_asks in
+        let side = Option.value_exn (RespObj.string_exn o "side" |> side_of_bmex) in
+        let current_table = match side with `Buy -> cfg.current_bids | `Sell -> cfg.current_asks in
         String.Table.update current_table sym ~f:begin function
           | Some old_o -> RespObj.merge old_o o
           | None -> o
@@ -86,17 +107,23 @@ end
 type best_price_kind = Best | Vwap
 
 type instrument_info = {
-  bids_initialized: unit Ivar.t [@default Ivar.create ()];
-  asks_initialized: unit Ivar.t [@default Ivar.create ()];
-  max_pos_size: int;
-  ticker: (int * int) Pipe.Reader.t;
-} [@@deriving create]
+  bids_initialized: unit Ivar.t ;
+  asks_initialized: unit Ivar.t ;
+  max_pos_size: int ;
+  ticker: (int * int) Pipe.Reader.t ;
+}
+
+let create_instrument_info
+    ?(bids_initialized=Ivar.create ())
+    ?(asks_initialized=Ivar.create ())
+    ~max_pos_size ~ticker () =
+  { bids_initialized ; asks_initialized ; max_pos_size ; ticker }
 
 type ticksize = {
   multiplier: Float.t; (* i.e. 0.01 *)
   mult_exponent: Int.t; (* 0.01 -> -2 *)
   divisor: Int.t; (* i.e. 1_000_000 *)
-} [@@deriving create]
+}
 
 let set_sign sign i = match sign, Int.sign i with
 | Sign.Zero, _ -> invalid_arg "set_sign"
@@ -120,8 +147,8 @@ let book_modify_qty ?(allow_empty=false) book price qty =
     )
 
 let best_of_side = function
-| Dtc.Buy -> Int.Map.max_elt
-| Sell -> Int.Map.min_elt
+| `Buy -> Int.Map.max_elt
+| `Sell -> Int.Map.min_elt
 
 let exponent_divisor_of_tickSize tickSize =
   let ts_str = Printf.sprintf "%.0e" tickSize in
@@ -148,7 +175,7 @@ let mk_new_limit_order ~symbol ~ticksize ~side ~price ~qty uuid_str =
   `Assoc [
     "clOrdID", `String uuid_str;
     "symbol", `String symbol;
-    "side", `String (match side with Dtc.Buy -> "Buy" | Sell -> "Sell");
+    "side", `String (Side.to_bitmex_string side);
     "price", `Float (float_of_satoshis symbol ticksize price);
     "orderQty", `Int qty;
     "execInst", `String "ParticipateDoNotInitiate"
@@ -157,7 +184,7 @@ let mk_new_limit_order ~symbol ~ticksize ~side ~price ~qty uuid_str =
 let mk_amended_limit_order ?price ?qty ~symbol ~side ~ticksize orig oid =
   `Assoc (List.filter_opt [
       Some ("symbol", `String symbol);
-      Some ("side", `String (match side with Dtc.Buy -> "Buy" | Sell -> "Sell"));
+      Some ("side", `String (Side.to_bitmex_string side));
       Some ((match orig with `S -> "orderID" | `C -> "clOrdID"), `String oid);
       Option.map qty ~f:(fun qty -> "leavesQty", `Int qty);
       Option.map price ~f:(fun price -> "price", `Float (float_of_satoshis symbol ticksize price));

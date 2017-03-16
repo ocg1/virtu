@@ -1,12 +1,12 @@
 (* Virtu: market making bot for BitMEX *)
 
-open Core.Std
-open Async.Std
+open Core
+open Async
 open Log.Global
 
 open Dtc
-open Util
-open Bs_devkit.Core
+open Virtu_util
+open Bs_devkit
 open Bs_api.BMEX
 module B = Bs_api.BMEX
 
@@ -48,7 +48,7 @@ module OrderBook = struct
 
   let bids : (Int.t Int.Map.t) String.Table.t = String.Table.create ()
   let asks : (Int.t Int.Map.t) String.Table.t = String.Table.create ()
-  let book_of_side = function Dtc.Buy -> bids | Sell -> asks
+  let book_of_side = function `Buy -> bids | `Sell -> asks
 
   let best_price ?remove_order side symbol =
     let open Option.Monad_infix in
@@ -61,11 +61,11 @@ module OrderBook = struct
   type vwap = {
     max_pos_p: int;
     total_v: int;
-  } [@@deriving create]
+  }
 
   let bid_vwaps : vwap String.Table.t = String.Table.create ()
   let ask_vwaps : vwap String.Table.t = String.Table.create ()
-  let vwaps_of_side = function Dtc.Buy -> bid_vwaps | Sell -> ask_vwaps
+  let vwaps_of_side = function `Buy -> bid_vwaps | `Sell -> ask_vwaps
 
   let vwap side symbol =
     let vwaps = vwaps_of_side side in
@@ -73,15 +73,15 @@ module OrderBook = struct
 
   let mid_price ?remove_bid ?remove_ask symbol = function
     | Best ->
-      let best_bid = best_price ?remove_order:remove_bid Dtc.Buy symbol in
-      let best_ask = best_price ?remove_order:remove_ask Sell symbol in
+      let best_bid = best_price ?remove_order:remove_bid `Buy symbol in
+      let best_ask = best_price ?remove_order:remove_ask `Sell symbol in
       Option.map2 best_bid best_ask (fun (bb,_) (ba,_) ->
           let midPrice =  (bb + ba) / 2 in
           midPrice, ba - midPrice
         )
     | Vwap ->
-      let vwap_bid = vwap Dtc.Buy symbol in
-      let vwap_ask = vwap Sell symbol in
+      let vwap_bid = vwap `Buy symbol in
+      let vwap_ask = vwap `Sell symbol in
       Option.map2 vwap_bid vwap_ask
         (fun { max_pos_p=mp; total_v=tv } { max_pos_p=mp'; total_v=tv' } ->
            let vb = mp / tv in
@@ -124,7 +124,9 @@ let compute_orders ?order symbol side price newQty =
   let leavesQty = Option.map order ~f:(fun o -> RespObj.int64_exn o "leavesQty" |> Int64.to_int_exn) in
   let ticksize = String.Table.find_exn ticksizes symbol in
   let leavesQtySexp = Option.sexp_of_t Int.sexp_of_t leavesQty |> Sexp.to_string_hum in
-  debug "compute_orders %s %s %d %s %d" symbol (Dtc.sexp_of_side side |> Sexp.to_string) (price / ticksize.divisor) leavesQtySexp newQty;
+  debug "compute_orders %s %s %d %s %d" symbol
+    (Side.to_bitmex_string side)
+    (price / ticksize.divisor) leavesQtySexp newQty;
   match leavesQty with
   | None when newQty > 0 ->
     let clOrdID = Uuid.(create () |> to_string) in
@@ -162,18 +164,18 @@ let on_position_update symbol oldQty diff =
   info "current orders: %s %s" (string_of_order currentBid) (string_of_order currentAsk);
   let currentBid = Option.bind currentBid (fun o -> if is_in_flight o then None else Some o) in
   let currentAsk = Option.bind currentAsk (fun o -> if is_in_flight o then None else Some o) in
-  let bidPrice = match Option.(currentBid >>= price_qty_of_order), OrderBook.best_price Buy symbol with
+  let bidPrice = match Option.(currentBid >>= price_qty_of_order), OrderBook.best_price `Buy symbol with
   | Some (price, _qty), _ -> price
   | None, Some (price, _qty) -> price
   | _ -> failwith "No suitable bid price found"
   in
-  let askPrice = match Option.(currentAsk >>= price_qty_of_order), OrderBook.best_price Sell symbol with
+  let askPrice = match Option.(currentAsk >>= price_qty_of_order), OrderBook.best_price `Sell symbol with
   | Some (price, _qty), _ -> price
   | None, Some (price, _qty) -> price
   | _ -> failwith "No suitable ask price found"
   in
-  let bidSubmit, bidAmend = compute_orders ?order:currentBid symbol Buy bidPrice newBidQty in
-  let askSubmit, askAmend = compute_orders ?order:currentAsk symbol Sell askPrice newAskQty in
+  let bidSubmit, bidAmend = compute_orders ?order:currentBid symbol `Buy bidPrice newBidQty in
+  let askSubmit, askAmend = compute_orders ?order:currentAsk symbol `Sell askPrice newAskQty in
   let make_th f orders = match
     List.fold_left orders ~init:[]
       ~f:(fun a -> function None -> a | Some (_, o) -> o :: a)
@@ -195,7 +197,7 @@ let on_instrument action data =
     String.Table.set ticksizes ~key:sym
       ~data:(RespObj.float_exn i "tickSize" |> fun multiplier ->
              let mult_exponent, divisor = exponent_divisor_of_tickSize multiplier in
-             create_ticksize ~multiplier ~mult_exponent ~divisor ());
+             { multiplier ; mult_exponent ; divisor });
     String.Table.set OrderBook.orders sym (Int.Table.create ());
     String.Table.set OrderBook.bids sym (Int.Map.empty);
     String.Table.set OrderBook.asks sym (Int.Map.empty)
@@ -261,9 +263,9 @@ let on_orderbook action data =
   let iter_f = function
   | (h :: t) as us when String.Table.mem quoted_instruments h.B.OrderBook.L2.symbol ->
     let side, best_elt_f, books, vwaps = match side_of_bmex h.side with
-    | Error _ -> failwith "buy_sell_of_bmex"
-    | Ok Buy -> Dtc.Buy, Int.Map.max_elt, OrderBook.bids, OrderBook.bid_vwaps
-    | Ok Sell -> Sell, Int.Map.min_elt, OrderBook.asks, OrderBook.ask_vwaps
+    | None -> failwith "buy_sell_of_bmex"
+    | Some `Buy -> `Buy, Int.Map.max_elt, OrderBook.bids, OrderBook.bid_vwaps
+    | Some `Sell -> `Sell, Int.Map.min_elt, OrderBook.asks, OrderBook.ask_vwaps
     in
     let old_book = if action = OB.Partial then Int.Map.empty else
       String.Table.find_exn books h.symbol
@@ -284,11 +286,11 @@ let on_orderbook action data =
     (* end; *)
 
     if action = Partial then begin
-      debug "[OB] %s %s initialized" h.symbol (Dtc.sexp_of_side side |> Sexp.to_string);
+      debug "[OB] %s %s initialized" h.symbol (Side.to_bitmex_string side);
       let { bids_initialized; asks_initialized } = String.Table.find_exn quoted_instruments h.symbol in
       match side with
-      | Buy -> Ivar.fill_if_empty bids_initialized ()
-      | Sell -> Ivar.fill_if_empty asks_initialized ()
+      | `Buy -> Ivar.fill_if_empty bids_initialized ()
+      | `Sell -> Ivar.fill_if_empty asks_initialized ()
     end
 
   | _ -> ()
@@ -303,8 +305,8 @@ let on_exec es =
     let execType = RespObj.string_exn e "execType" in
     let orderID = RespObj.string_exn e "orderID" in
     let clOrdID = RespObj.string_exn e "clOrdID" in
-    let side = RespObj.string_exn e "side" |> side_of_bmex |> Result.ok_or_failwith in
-    let current_table = match side with Buy -> current_bids | Sell -> current_asks in
+    let side = Option.value_exn (RespObj.string_exn e "side" |> side_of_bmex) in
+    let current_table = match side with `Buy -> current_bids | `Sell -> current_asks in
     if clOrdID <> "" then String.Table.set current_table symbol e;
     debug "[E] %s %s (%s)" symbol execType (String.sub orderID 0 8);
     match execType with
@@ -312,7 +314,7 @@ let on_exec es =
     | "Replaced" -> ()
     | "Trade" ->
       let lastQty = RespObj.int64_exn e "lastQty" |> Int64.to_int_exn in
-      let lastQty = match side with Buy -> lastQty | Sell -> Int.neg lastQty in
+      let lastQty = match side with `Buy -> lastQty | `Sell -> Int.neg lastQty in
       String.Table.update positions symbol ~f:begin function
       | Some qty ->
         don't_wait_for @@ on_position_update symbol qty lastQty;
@@ -411,8 +413,12 @@ let tickers_of_instrument ?log = function
 let main cfg port daemon pidfile logfile loglevel wsllevel main dry fixed remfixed instruments () =
   don't_wait_for begin
     Lock_file.create_exn pidfile >>= fun () ->
-    let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> Result.ok_or_failwith in
-    let { Cfg.key; secret; quote } = List.Assoc.find_exn cfg (if main then "BMEX" else "BMEXT") in
+    let cfg = begin match Sexplib.Sexp.load_sexp_conv cfg Cfg.t_of_sexp with
+    | `Error (exn, _) -> raise exn
+    | `Result cfg -> cfg
+    end in
+    let { Cfg.key; secret; quote } =
+      List.Assoc.find_exn ~equal:String.(=) cfg (if main then "BMEX" else "BMEXT") in
     let secret_cstruct = Cstruct.of_string secret in
     testnet := not main;
     api_key := key;

@@ -1,12 +1,12 @@
-open Core.Std
-open Async.Std
+open Core
+open Async
 open Log.Global
 
 open Dtc
 
-open Bs_devkit.Core
+open Bs_devkit
 
-type trade = { price: int; qty: int; side: BuyOrSell.t } [@@deriving sexp]
+type trade = { price: int; qty: int; side: [`Buy | `Sell] } [@@deriving sexp]
 
 type evt =
   | Trade of trade
@@ -16,7 +16,7 @@ type evt =
 type msg = {
   ts: Time_ns.t;
   data: evt;
-} [@@deriving create]
+}
 
 module LDB = struct
   let trades ?(max_count=Int.max_value) ?(low=Time_ns.min_value) ?(high=Time_ns.max_value) db =
@@ -33,10 +33,10 @@ module LDB = struct
       let { Tick.p; v; side } = Tick.Bytes.read' ~ts ~data () in
       let price = Int63.to_int_exn p in
       let qty = Int63.to_int_exn v in
-      let side = match side with `Buy -> BuyOrSell.Buy | `Sell -> Sell | _ -> invalid_arg "side" in
+      let side = Option.value_exn side in
       incr count;
       Iterator.next i;
-      Pipe.write w @@ create_msg ts (Trade { price; qty; side }) () >>= fun () ->
+      Pipe.write w @@ { ts ; data = (Trade { price; qty; side }) } >>= fun () ->
       create_f w
     in
     Pipe.create_reader ~close_on_exception:true create_f
@@ -55,7 +55,7 @@ module LDB = struct
       let update = OB.bin_read_t ~pos_ref:(ref 0) @@ Bigstring.of_string data in
       incr count;
       Iterator.next i;
-      Pipe.write w @@ create_msg ts (OB update) () >>= fun () ->
+      Pipe.write w @@ { ts ; data = (OB update) } >>= fun () ->
       create_f w
     in
     Pipe.create_reader ~close_on_exception:true create_f
@@ -83,7 +83,7 @@ let main gnuplot max_count low high (db_ob, db_trades, ticksize, size) () =
   | OB ({ action=Partial; data={ id; side; price; size }} as ob)
   | OB ({ action=Insert; data={ id; side; price; size }} as ob) ->
     if not gnuplot then Format.printf "%a %a@." Time_ns.pp ts Sexp.pp (OB.sexp_of_t ob);
-    let table = match side with Bid -> bids | Ask -> asks in
+    let table = match side with `Buy -> bids | `Sell -> asks in
     if ob.action = Partial && !last_partial = false then begin
       Int.Table.clear obs;
       table := Int.Map.empty;
@@ -98,10 +98,10 @@ let main gnuplot max_count low high (db_ob, db_trades, ticksize, size) () =
     (* Option.iter (Int.Table.find obs id) ~f:begin fun (oldp, _) -> *)
     let oldp, _ = Int.Table.find_exn obs id in
       Int.Table.remove obs id;
-      let table = match side with Bid -> bids | Ask -> asks in
+      let table = match side with `Buy -> bids | `Sell -> asks in
       table := Int.Map.update !table oldp ~f:(function
         | None -> failwith "Inconsistent orderbook"
-        | Some bs -> List.Assoc.remove bs id
+        | Some bs -> List.Assoc.remove ~equal:Int.(=) bs id
         );
     (* end; *)
     last_partial := false;
@@ -109,10 +109,10 @@ let main gnuplot max_count low high (db_ob, db_trades, ticksize, size) () =
     if not gnuplot then Format.printf "%a %a@." Time_ns.pp ts Sexp.pp (OB.sexp_of_t ob);
     let oldp, _ = Int.Table.find_exn obs id in
     Int.Table.set obs id (price, size);
-    let table = match side with Bid -> bids | Ask -> asks in
+    let table = match side with `Buy -> bids | `Sell -> asks in
     let intermediate = Int.Map.update !table oldp ~f:(function
       | None -> failwith "Inconsistent orderbook"
-      | Some bs -> List.Assoc.remove bs id
+      | Some bs -> List.Assoc.remove ~equal:Int.(=) bs id
       )
     in
     table := Int.Map.add_multi intermediate price (id, size);
@@ -121,7 +121,7 @@ let main gnuplot max_count low high (db_ob, db_trades, ticksize, size) () =
     if !count = 0 then ts_int_at_start := Time_ns.to_int_ns_since_epoch ts;
     let old_position = !position in
     let old_balance = !balance in
-    let qty = match side with Buy -> Int.neg qty | Sell -> qty in
+    let qty = match side with `Buy -> Int.neg qty | `Sell -> qty in
     let max_buy = size - old_position in
     let max_sell = - size - old_position in
     let trade_qty = match Int.sign qty with

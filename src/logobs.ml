@@ -1,9 +1,9 @@
-open Core.Std
-open Async.Std
+open Core
+open Async
 open Log.Global
 
-open Dtc
-open Bs_devkit.Core
+(* open Dtc *)
+open Bs_devkit
 
 let bmex_dbs = String.Table.create ()
 let plnx_dbs = String.Table.create ()
@@ -12,17 +12,16 @@ module BMEX = struct
   open Bs_api.BMEX
 
   let update_of_l2 { OrderBook.L2.id; side; size; price } =
-    let side = side_of_bmex side |> Result.ok_or_failwith in
+    let side = Option.value_exn (side_of_bmex side) in
     let price = Option.value_map price ~default:0 ~f:satoshis_int_of_float_exn in
     let qty = Option.value ~default:0 size in
-    DB.create_book_entry ~side ~price ~qty ()
+    DB.{ side ; price ; qty }
 
   let trade_of_bmex { Trade.symbol; timestamp; side; price; size } =
-    let side = side_of_bmex side |> Result.ok_or_failwith in
+    let side = Option.value_exn (side_of_bmex side) in
     let price = satoshis_int_of_float_exn price in
-    let qty = Int64.to_int_exn size in
     let ts = Time_ns.of_string timestamp in
-    DB.create_trade ~ts ~side ~price ~qty ()
+    DB.{ ts ; side ; price ; qty = size }
 
   let evt_of_update_action up = function
   | OB.Partial | Insert | Update -> DB.BModify up
@@ -99,14 +98,15 @@ module PLNX = struct
       Ws.Msgpck.subscribe to_ws_w syms_polo >>| fun reqids ->
       symbols_of_req_ids := Option.value_exn ~message:"Ws.subscribe" (List.zip reqids symbols)
     | Subscribed { reqid; id } ->
-      let sym = List.Assoc.find_exn !symbols_of_req_ids reqid in
+      let sym = List.Assoc.find_exn ~equal:Int.(=) !symbols_of_req_ids reqid in
       let sym_polo = polo_of_symbol sym in
       Int.Table.set symbols_of_sub_ids id sym;
       let db = String.Table.find_exn plnx_dbs sym in
       let rec loop () =
         Rest.books ~symbol:sym_polo () >>= function
         | Ok books ->
-          let { Rest.asks; bids; seq } = List.Assoc.find_exn books sym_polo in
+          let { Rest.asks; bids; seq } =
+            List.Assoc.find_exn ~equal:String.(=) books sym_polo in
           let evts = List.map (bids @ asks) ~f:(fun evt -> DB.BModify evt) in
           store db seq evts;
           info "stored %d %s partial" (List.length evts) sym;
@@ -122,7 +122,9 @@ module PLNX = struct
     | Event { Wamp.pubid; subid; details; args; kwArgs } ->
       let sym = Int.Table.find_exn symbols_of_sub_ids subid in
       let db = String.Table.find_exn plnx_dbs sym in
-      let seq = match List.Assoc.find_exn kwArgs "seq" with Msgpck.Int i -> i | _ -> failwith "seq" in
+      let seq = match List.Assoc.find_exn ~equal:String.(=) kwArgs "seq" with
+      | Msgpck.Int i -> i
+      | _ -> failwith "seq" in
       let map_f msg =
         let open Ws.Msgpck in
         match of_msgpck msg with
@@ -144,7 +146,7 @@ module PLNX = struct
       store db seq @@ List.map args ~f:map_f;
       Deferred.unit
     | msg ->
-      error "unknown message: %s" (Wamp.sexp_of_msg Msgpck.sexp_of_t msg |> Sexplib.Sexp.to_string);
+      (* error "unknown message: %s" (Wamp.sexp_of_msg Msgpck.sexp_of_t msg |> Sexplib.Sexp.to_string); *)
       Deferred.unit
     in
     let ws = Ws.open_connection to_ws in
@@ -210,7 +212,7 @@ let record =
   Command.basic ~summary:"Log exchanges order books" spec record
 
 let show datadir rev_iter max_ticks symbol () =
-  let open Core.Std in
+  let open Core in
   let nb_read = ref 0 in
   let buf = Bigbuffer.create 4096 in
   let iter_f seq data =

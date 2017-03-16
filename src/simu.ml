@@ -1,7 +1,7 @@
-open Core.Std
+open Core
 
 open Dtc
-open Bs_devkit.Core
+open Bs_devkit
 
 let ticksizes =
   ["ETHXBT", 1]
@@ -16,13 +16,13 @@ module LevelDB_ext = struct
     | DB.Trade _ -> (bids, asks)
     | BModify { side; price; qty } -> begin
       match side with
-      | Buy -> Int.Map.add bids price qty, asks
-      | Sell -> bids, Int.Map.add asks price qty
+      | `Buy -> Int.Map.add bids price qty, asks
+      | `Sell -> bids, Int.Map.add asks price qty
       end
     | BRemove { side; price } -> begin
       match side with
-      | Buy -> Int.Map.remove bids price, asks
-      | Sell -> bids, Int.Map.remove asks price
+      | `Buy -> Int.Map.remove bids price, asks
+      | `Sell -> bids, Int.Map.remove asks price
       end
     in
     List.fold evts ~init:(bids, asks) ~f:update_f
@@ -78,7 +78,15 @@ type state = {
   mid_price: int [@default 0];
   balance: int [@default 0];
   nb_contracts: int [@default 0];
-} [@@deriving create, sexp]
+} [@@deriving sexp]
+
+let create_state
+    ?(bids = Int.Map.empty)
+    ?(asks = Int.Map.empty)
+    ?(mid_price = 0)
+    ?(balance = 0)
+    ?(nb_contracts = 0) () =
+  { bids ; asks ; mid_price ; balance ; nb_contracts }
 
 let best_bid = Int.Map.max_elt_exn
 let best_ask = Int.Map.min_elt_exn
@@ -89,7 +97,7 @@ let pnl { balance; nb_contracts; mid_price; } =
 
 let main gnuplot datadir low high size (symbol, max_pos_size) () =
   let max_pos_size = max_pos_size * 100_000_000 in
-  let ticksize = List.Assoc.find_exn ticksizes symbol in
+  let ticksize = List.Assoc.find_exn ~equal:String.(=) ticksizes symbol in
   let fill_prob = make_fill_prob 0.9 (log 0.9 /. log 0.5) in
   let init_seq = ref 0 in
   let blanket old_state bids asks seq evts =
@@ -115,11 +123,12 @@ let main gnuplot datadir low high size (symbol, max_pos_size) () =
     let state = { old_state with bids=mybids; asks=myasks; mid_price } in
     let fold_evts state = function
     | DB.BModify _ | BRemove _ -> state
-    | Trade ({ ts; side=Buy; price; qty } as trade) ->
+    | Trade ({ ts; side = `Buy; price; qty } as trade) ->
       if Random.float 1. > fill_prob (my_a_distance // a_distance)
       || state.nb_contracts = - max_pos_size
       then begin
-        if not gnuplot then Format.printf "%d MISS %a %a@." seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state state);
+        if not gnuplot then Format.printf "%d MISS %a %a@."
+            seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state state);
         state
       end
       else
@@ -144,7 +153,7 @@ let main gnuplot datadir low high size (symbol, max_pos_size) () =
       else Format.printf "%d %a %a@." seq Sexp.pp (DB.sexp_of_trade trade) Sexp.pp (sexp_of_state new_state);
       new_state
 
-    | Trade ({ ts; side=Sell; price; qty } as trade) ->
+    | Trade ({ ts; side = `Sell; price; qty } as trade) ->
       if Random.float 1. > fill_prob (my_b_distance // b_distance)
       || state.nb_contracts = max_pos_size
       then begin

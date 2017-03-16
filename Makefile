@@ -1,5 +1,6 @@
 all:
-	./build simu.byte virtu.byte logobs.byte poloarb.native
+	jbuilder build @install
 
+.PHONY: clean
 clean:
-	./build clean
+	rm -rf _build

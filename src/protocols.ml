@@ -1,7 +1,7 @@
-open Core.Std
-open Async.Std
+open Core
+open Async
 
-open Bs_devkit.Core
+open Bs_devkit
 
 module OrderBook = struct
   type client =
@@ -11,10 +11,10 @@ module OrderBook = struct
 
   type ticker = {
     symbol: string;
-    side: Side.t;
+    side: [`Buy | `Sell];
     best: int;
     vwap: int;
-  } [@@deriving create,bin_io]
+  } [@@deriving bin_io]
 
   type server =
     | Subscribed of string * int

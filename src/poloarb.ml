@@ -1,9 +1,9 @@
-open Core.Std
-open Async.Std
+open Core
+open Async
 open Log.Global
 
-open Dtc.Dtc
-open Bs_devkit.Core
+(* open Dtc.Dtc *)
+open Bs_devkit
 open Bs_api.PLNX
 open Graph
 
@@ -48,7 +48,7 @@ let arbitrable_symbols = ref String.Set.empty
 let books : books String.Table.t = String.Table.create ()
 let balances : Float.t String.Table.t = String.Table.create ()
 
-type vwap = { bid: float; bid_qty: int; ask: float; ask_qty: int } [@@deriving create]
+type vwap = { bid: float; bid_qty: int; ask: float; ask_qty: int }
 let vwaps : vwap String.Table.t = String.Table.create ()
 
 let key = ref ""
@@ -57,21 +57,21 @@ let fees = ref Float.one
 let threshold = ref 0
 
 let top_changed ~side ~oldb ~newb = match side with
-| Buy -> Int.Map.max_elt oldb <> Int.Map.max_elt newb
-| Sell -> Int.Map.min_elt oldb <> Int.Map.min_elt newb
+| `Buy -> Int.Map.max_elt oldb <> Int.Map.max_elt newb
+| `Sell -> Int.Map.min_elt oldb <> Int.Map.min_elt newb
 
 let get_entry ~symbol ~side ~price =
   let book = String.Table.find books symbol in
   Option.bind book ~f:begin fun { bids; asks } ->
-    Int.Map.find (match side with Buy -> bids | Sell -> asks) price
+    Int.Map.find (match side with `Buy -> bids | `Sell -> asks) price
   end
 
 let best_entry ~symbol ~side =
   let book = String.Table.find books symbol in
   Option.bind book ~f:begin fun { bids; asks } ->
     match side with
-    | Buy -> Int.Map.max_elt bids
-    | Sell -> Int.Map.min_elt asks
+    | `Buy -> Int.Map.max_elt bids
+    | `Sell -> Int.Map.min_elt asks
   end
 
 exception Result of float * int
@@ -95,24 +95,24 @@ let vwap ~symbol ~side ~threshold =
   let threshold = ((threshold // price) *. 1e8) |> Int.of_float in
   String.Table.find books symbol >>| fun { bids; asks } ->
   match side with
-  | Buy -> begin try
+  | `Buy -> begin try
       Int.Map.fold_right bids ~init:(0., 0) ~f:(fold_f_exn ~threshold)
     with Result (vwap, q) -> (vwap, q)
     end
-  | Sell -> begin try
+  | `Sell -> begin try
       Int.Map.fold asks ~init:(0., 0) ~f:(fold_f_exn ~threshold)
     with Result (vwap, q) -> (vwap, q)
     end
 
 let symbol_of_currs ~quote ~base = quote ^ "_" ^ base
 
-type symbol = { quote: string; base: string } [@@deriving create]
+type symbol = { quote: string; base: string }
 
 let currs : symbol String.Table.t = String.Table.create ()
 
 let currs_of_symbol sym =
   match String.split sym ~on:'_' with
-  | [quote; base] -> create_symbol ~quote ~base ()
+  | [quote; base] -> { quote ; base }
   | _ -> invalid_argf "currs_of_symbol: %s" sym ()
 
 let execute_arbitrage ?(dry_run=true) ?buf cycle =
@@ -121,11 +121,13 @@ let execute_arbitrage ?(dry_run=true) ?buf cycle =
     let symbol, inverted =
       if String.Table.mem books symbol then symbol, false else symbol_of_currs c2 c1, true
     in
-    let side = if inverted then Buy else Sell in
+    let side = if inverted then `Buy else `Sell in
     match String.Table.find vwaps symbol with
     | None -> failwithf "No vwaps for %s" symbol ()
     | Some { bid; bid_qty; ask; ask_qty } ->
-      let price, qty = match side with Buy -> bid, bid_qty // 100_000_000 | Sell -> ask, ask_qty // 100_000_000 in
+      let price, qty = match side with
+      | `Buy -> bid, bid_qty // 100_000_000
+      | `Sell -> ask, ask_qty // 100_000_000 in
       let c1_balance = String.Table.find_exn balances c1 in
       let pricef' = if inverted then 1. /. price else price in
       let q2 = if inverted then qty *. price else qty in
@@ -141,8 +143,10 @@ let execute_arbitrage ?(dry_run=true) ?buf cycle =
           pricef';
         Deferred.unit
       | false ->
-        Rest.order ?buf ~key:!key ~secret:!secret ~side:Buy
-          ~tif:Fill_or_kill ~symbol ~price:(satoshis_int_of_float_exn price) ~qty:(satoshis_int_of_float_exn q2) () >>| fun res ->
+        Rest.order ?buf ~key:!key ~secret:!secret
+          ~side:`Buy  ~tif:`Fill_or_kill ~symbol
+          ~price:(satoshis_int_of_float_exn price)
+          ~qty:(satoshis_int_of_float_exn q2) () >>| fun res ->
         let { Rest.id; trades; amount_unfilled } = Or_error.ok_exn res in
         let q1, q2 = List.fold_left trades ~init:(0., 0.) ~f:begin fun (q1, q2) { gid; id; trade={ ts; side; price; qty } } ->
             let price = price // 100_000_000 in
@@ -203,28 +207,30 @@ let find_negative_cycle g ~symbol ~bid ~ask =
   end
 
 let find_negative_cycle ~symbol ~threshold =
-  let bid = vwap ~symbol ~side:Buy ~threshold in
-  let ask = vwap ~symbol ~side:Sell ~threshold in
+  let bid = vwap ~symbol ~side:`Buy ~threshold in
+  let ask = vwap ~symbol ~side:`Sell ~threshold in
   match bid, ask with
   | Some (bpaid, bqty), Some (apaid, aqty) ->
     let bvwap = bpaid /. (bqty // 100_000_000) in
     let avwap = apaid /. (aqty // 100_000_000) in
     (* info "find_negative_cycle: %s %f %d %f %d %f %f" symbol bpaid bqty apaid aqty bvwap avwap; *)
-    String.Table.set vwaps ~key:symbol ~data:(create_vwap ~bid:bpaid ~bid_qty:bqty ~ask:apaid ~ask_qty:aqty ());
+    String.Table.set vwaps ~key:symbol ~data:begin
+      { bid = bpaid ; bid_qty = bqty ; ask = apaid ; ask_qty = aqty }
+    end ;
     find_negative_cycle g ~symbol ~bid:bvwap ~ask:avwap
   | _ -> ()
 
 let set_entry ~symbol ~side ~seq ~price ~qty =
   let { bids; asks } = String.Table.find_exn books symbol in
   match side with
-  | Buy ->
+  | `Buy ->
     let bids' = match Int.Map.find bids price with
     | None -> Int.Map.add bids price { seq; qty }
     | Some entry -> if entry.seq > seq then bids else Int.Map.add bids price { seq; qty }
     in
     String.Table.set books symbol { bids=bids'; asks };
     top_changed side bids bids'
-  | Sell ->
+  | `Sell ->
     let asks' = match Int.Map.find asks price with
     | None -> Int.Map.add asks price { seq; qty }
     | Some entry -> if entry.seq > seq then asks else Int.Map.add asks price { seq; qty }
@@ -235,14 +241,14 @@ let set_entry ~symbol ~side ~seq ~price ~qty =
 let del_entry side symbol ~seq ~price =
   let { bids; asks } = String.Table.find_exn books symbol in
   match side with
-  | Buy ->
+  | `Buy ->
     let bids' = match Int.Map.find bids price with
     | None -> bids
     | Some entry -> if entry.seq > seq then bids else Int.Map.remove bids price
     in
     String.Table.set books symbol { bids=bids'; asks };
     top_changed side bids bids'
-  | Sell ->
+  | `Sell ->
     let asks' = match Int.Map.find asks price with
     | None -> asks
     | Some entry -> if entry.seq > seq then asks else Int.Map.remove asks price
@@ -260,7 +266,7 @@ let ws buf ws_init ob_initialized =
     Ws.Msgpck.subscribe to_ws_w @@ symbols >>| fun reqids ->
     symbols_of_req_ids := Option.value_exn ~message:"Ws.subscribe" (List.zip reqids symbols)
   | Subscribed { reqid; id } ->
-    let sym = List.Assoc.find_exn !symbols_of_req_ids reqid in
+    let sym = List.Assoc.find_exn ~equal:Int.(=) !symbols_of_req_ids reqid in
     Int.Table.set symbols_of_sub_ids id sym;
     debug "subscribed %s" sym;
     if Int.Table.length symbols_of_sub_ids = String.Table.length books then Ivar.fill_if_empty ws_init ();
@@ -269,7 +275,9 @@ let ws buf ws_init ob_initialized =
     let symbol = Int.Table.find_exn symbols_of_sub_ids subid in
     let { quote; base } = String.Table.find_exn currs symbol in
     if not @@ String.Set.mem !arbitrable_symbols base then Deferred.unit else
-    let seq = match List.Assoc.find_exn kwArgs "seq" with Msgpck.Int i -> i | _ -> failwith "seq" in
+    let seq = match List.Assoc.find_exn ~equal:String.(=) kwArgs "seq" with
+    | Msgpck.Int i -> i
+    | _ -> failwith "seq" in
     let iter_f msg =
       let open Ws.Msgpck in
       match of_msgpck msg with
@@ -292,7 +300,7 @@ let ws buf ws_init ob_initialized =
     List.iter args ~f:iter_f;
     Deferred.unit
   | msg ->
-    error "unknown message: %s" (Wamp.sexp_of_msg Msgpck.sexp_of_t msg |> Sexplib.Sexp.to_string);
+    (* error "unknown message: %s" (Wamp.sexp_of_msg Msgpck.sexp_of_t msg |> Sexplib.Sexp.to_string); *)
     Deferred.unit
   in
   let ws = Ws.open_connection to_ws in
@@ -358,8 +366,11 @@ let main cfg daemon pidfile logfile loglevel fees' min_qty () =
     set_level (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
     let buf = Bi_outbuf.create 4096 in
     let ws_init = Ivar.create () in
-    let cfg = Yojson.Safe.from_file cfg |> Cfg.of_yojson |> Result.ok_or_failwith in
-    let cfg = List.Assoc.find_exn cfg "PLNX" in
+    let cfg = begin match Sexplib.Sexp.load_sexp_conv cfg Cfg.t_of_sexp with
+    | `Error (exn, _) -> raise exn
+    | `Result cfg -> cfg
+    end in
+    let cfg = List.Assoc.find_exn cfg ~equal:String.(=) "PLNX" in
     key := cfg.key;
     secret := Cstruct.of_string cfg.secret;
     info "poloarb starting";

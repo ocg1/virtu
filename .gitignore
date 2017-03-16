@@ -4,7 +4,6 @@ tmp
 \.\#*
 \#*#
 *.install
-*.native
-*.byte
+**/*.merlin
 log
 run
