@@ -8,6 +8,24 @@ open Bs_devkit
 let bmex_dbs = String.Table.create ()
 let plnx_dbs = String.Table.create ()
 
+let make_store () =
+  let key = String.create 8 in
+  let buf = Bigbuffer.create 128 in
+  let scratch = Bigstring.create 128 in
+  fun ?sync db seq evts ->
+    Bigbuffer.clear buf;
+    Binary_packing.pack_signed_64_int_big_endian ~buf:key ~pos:0 seq;
+    let nb_of_evts = List.length evts |> Bin_prot.Nat0.of_int in
+    let nb_written = Bin_prot.Write.bin_write_nat0 scratch ~pos:0 nb_of_evts in
+    let scratch_shared = Bigstring.sub_shared scratch ~len:nb_written in
+    Bigbuffer.add_bigstring buf scratch_shared;
+    List.iter evts ~f:begin fun e ->
+      let nb_written = Bs_devkit.DB.bin_write_t scratch ~pos:0 e in
+      let scratch_shared = Bigstring.sub_shared scratch ~len:nb_written in
+      Bigbuffer.add_bigstring buf scratch_shared;
+    end;
+    LevelDB.put ?sync db key @@ Bigbuffer.contents buf
+
 module BMEX = struct
   open Bs_api.BMEX
 
@@ -28,7 +46,7 @@ module BMEX = struct
   | Delete -> BRemove up
 
   let make_on_evt () =
-    let store = DB.make_store () in
+    let store = make_store () in
     let open Bs_api.BMEX in
     fun kind action data ->
       let now = Time_ns.(now () |> Time_ns.to_int_ns_since_epoch) in
@@ -89,7 +107,7 @@ module PLNX = struct
 
   let record symbols =
     let syms_polo = List.map symbols ~f:polo_of_symbol in
-    let store = DB.make_store () in
+    let store = make_store () in
     let to_ws, to_ws_w = Pipe.create () in
     let symbols_of_req_ids = ref [] in
     let symbols_of_sub_ids = Int.Table.create () in
