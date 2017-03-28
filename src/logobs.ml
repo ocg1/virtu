@@ -69,6 +69,7 @@ module BMEX = struct
         let iter_f t =
           let db = String.Table.find_exn bmex_dbs t.Trade.symbol in
           let data = List.map data ~f:(fun t -> DB.Trade (trade_of_bmex t)) in
+          debug "%s" (DB.sexp_of_t_list data |> Sexp.to_string);
           store db now data
         in
         List.iter data ~f:iter_f
@@ -173,48 +174,63 @@ module PLNX = struct
       (fun exn -> error "%s" @@ Exn.to_string exn)
 end
 
+let (//) = Filename.concat
 let record daemon rundir logdir datadir loglevel instruments () =
   let instruments = List.fold_left instruments
       ~init:String.Map.empty ~f:begin fun a (exchange, symbol) ->
       String.Map.add_multi a exchange symbol
-    end
-  in
+    end in
   let executable_name = Sys.executable_name |> Filename.basename |> String.split ~on:'.' |> List.hd_exn in
   let pidfile = Filename.concat rundir @@ executable_name ^ ".pid" in
   let logfile = Filename.concat logdir @@ executable_name ^ ".log" in
-  if daemon then Daemon.daemonize ~cd:"." ();
   Signal.handle Signal.terminating ~f:begin fun _ ->
     info "OB logger stopping.";
     String.Table.iter bmex_dbs ~f:LevelDB.close;
     String.Table.iter plnx_dbs ~f:LevelDB.close;
     info "Saved %d dbs." @@ String.Table.(length bmex_dbs + length plnx_dbs);
-    don't_wait_for @@ Shutdown.exit 0
+    don't_wait_for (Shutdown.exit 0)
     end;
-  don't_wait_for begin
+  if daemon then Daemon.daemonize ~cd:"." ();
+  stage begin fun `Scheduler_started ->
+    Unix.mkdir ~p:() rundir >>= fun () ->
+    Unix.mkdir ~p:() logdir >>= fun () ->
+    let bitmex_dir = datadir // "bitmex" in
+    let plnx_dir = datadir // "poloniex" in
+    begin if String.Map.mem instruments "BMEX" then
+        Unix.mkdir ~p:() bitmex_dir
+      else Deferred.unit
+    end >>= fun () ->
+    begin if String.Map.mem instruments "PLNX" then
+      Unix.mkdir ~p:() plnx_dir
+      else Deferred.unit
+    end >>= fun () ->
     Lock_file.create_exn pidfile >>= fun () ->
     let log_outputs filename = Log.Output.[stderr (); file `Text ~filename] in
     set_output @@ log_outputs logfile;
     set_level @@ loglevel_of_int loglevel;
     info "logobs starting";
-    Option.iter (String.Map.find instruments "BMEX") ~f:begin fun syms ->
-      List.iter syms ~f:begin fun s ->
-        let (//) = Filename.concat in
-        let path = datadir // "bitmex.com" // s in
-        String.Table.set bmex_dbs s (LevelDB.open_db path)
-      end;
-      don't_wait_for @@ BMEX.record syms
-    end;
-    Option.iter (String.Map.find instruments "PLNX") ~f:begin fun syms ->
-      List.iter syms ~f:begin fun s ->
-        let (//) = Filename.concat in
-        let path = datadir // "poloniex.com" // s in
-        String.Table.set plnx_dbs s (LevelDB.open_db path)
-      end;
-      don't_wait_for @@ PLNX.record syms
-    end;
-    Deferred.never ()
-  end;
-  never_returns @@ Scheduler.go ()
+    let bmex_record = Option.value_map
+        (String.Map.find instruments "BMEX")
+        ~default:Deferred.unit
+        ~f:begin fun syms ->
+          List.iter syms ~f:begin fun s ->
+            let path = bitmex_dir // s in
+            String.Table.set bmex_dbs s (LevelDB.open_db path)
+          end;
+          BMEX.record syms
+        end in
+    let plnx_record = Option.value_map
+        (String.Map.find instruments "PLNX")
+        ~default:Deferred.unit
+        ~f:begin fun syms ->
+          List.iter syms ~f:begin fun s ->
+            let path = plnx_dir // s in
+            String.Table.set plnx_dbs s (LevelDB.open_db path)
+          end;
+          PLNX.record syms
+        end in
+    Deferred.all_unit [ bmex_record ; plnx_record ]
+  end
 
 let record =
   let spec =
@@ -227,10 +243,9 @@ let record =
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
     +> anon (sequence (t2 ("exchange" %: string) ("symbol" %: string)))
   in
-  Command.basic ~summary:"Log exchanges order books" spec record
+  Command.Staged.async ~summary:"Log exchanges order books" spec record
 
 let show datadir rev_iter max_ticks symbol () =
-  let open Core in
   let nb_read = ref 0 in
   let buf = Bigbuffer.create 4096 in
   let iter_f seq data =
@@ -249,7 +264,7 @@ let show datadir rev_iter max_ticks symbol () =
   in
   let iter_f = (if rev_iter then LevelDB.rev_iter else LevelDB.iter) iter_f in
   let dbpath = Filename.concat datadir symbol in
-  (match Sys.is_directory dbpath with
+  Core.(match Sys.is_directory dbpath with
   | `No | `Unknown -> invalid_argf "No DB for %s" symbol ()
   | `Yes -> ());
   let db = LevelDB.open_db dbpath in
@@ -259,7 +274,7 @@ let show =
   let spec =
     let open Command.Spec in
     empty
-    +> flag "-datadir" (optional_with_default "data/bitmex.com" string) ~doc:"path Where to store DBs (data/bitmex.com)"
+    +> flag "-datadir" (optional_with_default "data/bitmex" string) ~doc:"path Where to store DBs (data/bitmex)"
     +> flag "-rev-iter" no_arg ~doc:" Show latest records"
     +> flag "-n" (optional int) ~doc:"n Number of ticks to display (default: all)"
     +> anon ("symbol" %: string)
