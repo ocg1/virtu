@@ -146,21 +146,18 @@ let main gnuplot max_count low high (db_ob, db_trades, ticksize, size) () =
       Time_ns.pp ts price trade_qty !position balance position_value cur_pnl pnl_diff;
     incr count
   in
-  don't_wait_for begin
-    Monitor.try_with ~extract_exn:true
-      (fun () ->
-         let db_trades = LevelDB.open_db db_trades in
-         let db_ob = LevelDB.open_db db_ob in
-         let evts = LDB.interleave ?max_count ?low ?high db_trades db_ob in
-         Pipe.iter_without_pushback evts ~f:iter_f
-      ) >>= function
-    | Ok _ -> assert false
-    | Error Exit -> Shutdown.exit 0
-    | Error exn ->
-      error "%s" (Exn.to_string exn);
-      Shutdown.exit 0
-  end;
-  never_returns @@ Scheduler.go ()
+  Monitor.try_with ~extract_exn:true
+    (fun () ->
+       let db_trades = LevelDB.open_db db_trades in
+       let db_ob = LevelDB.open_db db_ob in
+       let evts = LDB.interleave ?max_count ?low ?high db_trades db_ob in
+       Pipe.iter_without_pushback evts ~f:iter_f
+    ) >>= function
+  | Ok _ -> assert false
+  | Error Exit -> Shutdown.exit 0
+  | Error exn ->
+    error "%s" (Exn.to_string exn);
+    Shutdown.exit 0
 
 let command =
   let spec =
@@ -172,6 +169,6 @@ let command =
     +> flag "-high" (optional string) ~doc:"timestamp High timestamp"
     +> anon (t4 ("ob" %: string) ("trades" %: string) ("tick_size" %: int) ("max_pos_size" %: int))
   in
-  Command.basic ~summary:"P/L simulator" spec main
+  Command.async ~summary:"P/L simulator" spec main
 
 let () = Command.run command

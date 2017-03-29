@@ -263,7 +263,8 @@ let rpc_server port =
   Rpc.Connection.serve implementations state_of_addr_conn (Tcp.on_port port) ()
 
 let main cfg port daemon pidfile logfile loglevel instruments () =
-  don't_wait_for begin
+  if daemon then Daemon.daemonize ~cd:"." ();
+  stage begin fun `Scheduler_started ->
     Lock_file.create_exn pidfile >>= fun () ->
     let cfg = begin match Sexplib.Sexp.load_sexp_conv cfg Cfg.t_of_sexp with
     | `Error (exn, _) -> raise exn
@@ -273,15 +274,13 @@ let main cfg port daemon pidfile logfile loglevel instruments () =
     bfx_key := key;
     bfx_secret := Cstruct.of_string secret;
     let buf = Bi_outbuf.create 4096 in
-    if daemon then Daemon.daemonize ~cd:"." ();
     set_output Log.Output.[stderr (); file `Text ~filename:logfile];
     Log.set_output log_bfx Log.Output.[stderr (); file `Text ~filename:logfile];
     set_level @@ loglevel_of_int loglevel;
     Log.set_level log_bfx @@ loglevel_of_int loglevel;
     List.iter instruments ~f:(fun (i, q) -> subscribe i q);
     Deferred.(all_unit [bfx_ws buf; ignore @@ rpc_server port])
-  end;
-  never_returns @@ Scheduler.go ()
+  end
 
 let command =
   let default_cfg = Filename.concat (Option.value_exn (Sys.getenv "HOME")) ".virtu" in
@@ -296,6 +295,6 @@ let command =
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
     +> anon (sequence (t2 ("instrument" %: string) ("quote" %: int)))
   in
-  Command.basic ~summary:"Hedger bot" spec main
+  Command.Staged.async ~summary:"Hedger bot" spec main
 
 let () = Command.run command

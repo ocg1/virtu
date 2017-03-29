@@ -411,7 +411,8 @@ let tickers_of_instrument ?log = function
 | _ -> invalid_arg "tickers_of_instrument"
 
 let main cfg port daemon pidfile logfile loglevel wsllevel main dry fixed remfixed instruments () =
-  don't_wait_for begin
+  if daemon then Daemon.daemonize ~cd:"." ();
+  stage begin fun `Scheduler_started ->
     Lock_file.create_exn pidfile >>= fun () ->
     let cfg = begin match Sexplib.Sexp.load_sexp_conv cfg Cfg.t_of_sexp with
     | `Error (exn, _) -> raise exn
@@ -425,7 +426,6 @@ let main cfg port daemon pidfile logfile loglevel wsllevel main dry fixed remfix
     api_secret := secret_cstruct;
     order_cfg := Order.create_cfg ~dry_run:dry ~current_bids ~current_asks ~testnet:(not main) ~key ~secret:secret_cstruct ();
     let instruments = if instruments = [] then quote else instruments in
-    if daemon then Daemon.daemonize ~cd:"." ();
     let log_outputs = Log.Output.[stderr (); file `Text ~filename:logfile] in
     set_output log_outputs;
     Log.set_output log_ws log_outputs;
@@ -446,11 +446,8 @@ let main cfg port daemon pidfile logfile loglevel wsllevel main dry fixed remfix
     | Some fixed, _ -> `Fixed fixed
     | _, Some remfixed -> `FixedRemote remfixed
     in
-    Deferred.(all_unit [
-        market_make strategy @@ String.Table.keys quoted_instruments;
-      ]);
-  end;
-  never_returns @@ Scheduler.go ()
+    market_make strategy (String.Table.keys quoted_instruments)
+  end
 
 let command =
   let default_cfg = Filename.concat (Option.value_exn (Sys.getenv "HOME")) ".virtu" in
@@ -470,6 +467,6 @@ let command =
     +> flag "-fixed-remote" (optional int) ~doc:"tick Post bid/ask with a fixed spread"
     +> anon (sequence (t2 ("instrument" %: string) ("quote" %: int)))
   in
-  Command.basic ~summary:"Market maker bot" spec main
+  Command.Staged.async ~summary:"Market maker bot" spec main
 
 let () = Command.run command

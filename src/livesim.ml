@@ -143,7 +143,8 @@ let main cfg daemon rundir logdir loglevel test instruments () =
   let pidfile = Filename.concat rundir @@ executable_name ^ ".pid" in
   let logfile = Filename.concat logdir @@ executable_name ^ ".log" in
   let datafile = Filename.concat logdir @@ executable_name ^ ".data" in
-  don't_wait_for begin
+  if daemon then Daemon.daemonize ~cd:"." ();
+  stage begin fun `Scheduler_started ->
     Lock_file.create_exn pidfile >>= fun () ->
     testnet := test;
     let cfg = begin match Sexplib.Sexp.load_sexp_conv cfg Cfg.t_of_sexp with
@@ -154,17 +155,16 @@ let main cfg daemon rundir logdir loglevel test instruments () =
       List.Assoc.find_exn ~equal:String.(=) cfg (if test then "BMEXT" else "BMEX") in
     let instruments = if instruments = [] then quote else instruments in
     let buf = Bi_outbuf.create 4096 in
-    if daemon then Daemon.daemonize ~cd:"." ();
     let log_outputs filename = Log.Output.[stderr (); file `Text ~filename] in
     set_output @@ log_outputs logfile;
     set_level @@ loglevel_of_int loglevel;
     Log.set_output log_sim @@ log_outputs datafile;
-    List.iter instruments ~f:(fun (symbol, max_pos_size) ->
-        String.Table.set quoted_instruments symbol max_pos_size;
-        String.Table.set positions symbol 0;
-      );
+    List.iter instruments ~f:begin fun (symbol, max_pos_size) ->
+      String.Table.set quoted_instruments symbol max_pos_size;
+      String.Table.set positions symbol 0;
+    end ;
     info "Sim starting";
-    Monitor.try_with_or_error (fun () ->
+    Monitor.try_with_or_error begin fun () ->
       let data_pipe = Log.Reader.pipe `Sexp datafile in
       Pipe.iter_without_pushback data_pipe ~f:Log.Message.(fun msg ->
           let msg = message msg in
@@ -172,14 +172,13 @@ let main cfg daemon rundir logdir loglevel test instruments () =
           let { symbol; resulting_pos } = trade_of_sexp s in
           String.Table.set positions symbol resulting_pos
         )
-      ) >>= function
+    end >>= function
     | Ok _ ->
       info "Done reading %s" datafile;
       simulate datafile buf @@ String.Table.keys quoted_instruments
     | Error _ ->
       simulate datafile buf @@ String.Table.keys quoted_instruments;
-  end;
-  never_returns @@ Scheduler.go ()
+  end
 
 let command =
   let default_cfg = Filename.concat (Option.value_exn (Sys.getenv "HOME")) ".virtu" in
@@ -194,6 +193,6 @@ let command =
     +> flag "-test" no_arg ~doc:" Use testnet"
     +> anon (sequence (t2 ("instrument" %: string) ("quote" %: int)))
   in
-  Command.basic ~summary:"Market maker simulator" spec main
+  Command.Staged.async ~summary:"Market maker simulator" spec main
 
 let () = Command.run command

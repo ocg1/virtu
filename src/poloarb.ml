@@ -360,7 +360,7 @@ let main cfg daemon pidfile logfile loglevel fees' min_qty () =
   threshold := min_qty;
   fees := 1. -. fees' // 10_000;
   if daemon then Daemon.daemonize ~cd:"." ();
-  don't_wait_for begin
+  stage begin fun `Scheduler_started ->
     Lock_file.create_exn pidfile >>= fun () ->
     set_output Log.Output.[stderr (); file `Text ~filename:logfile];
     set_level (match loglevel with 2 -> `Info | 3 -> `Debug | _ -> `Error);
@@ -392,8 +392,7 @@ let main cfg daemon pidfile logfile loglevel fees' min_qty () =
     update_books buf >>= fun () ->
     ob_initialized := true;
     ws_t
-  end;
-  never_returns @@ Scheduler.go ()
+  end
 
 let command =
   let default_cfg = Filename.concat (Option.value_exn (Sys.getenv "HOME")) ".virtu" in
@@ -408,6 +407,6 @@ let command =
     +> flag "-fees" (optional_with_default 25 int) ~doc:"bps fees (default: 25)"
     +> flag "-min-qty" (optional_with_default 50_000_000 int) ~doc:"sats Min qty to arbitrage (default: 0.5 XBT)"
   in
-  Command.basic ~summary:"Poloniex arbitrageur" spec main
+  Command.Staged.async ~summary:"Poloniex arbitrageur" spec main
 
 let () = Command.run command
