@@ -1,6 +1,5 @@
 open Core
 
-open Dtc
 open Bs_devkit
 
 let ticksizes =

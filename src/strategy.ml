@@ -1,7 +1,6 @@
 open Core
 open Async
 
-open Dtc
 open Bs_devkit
 open Bs_api.BMEX
 open Virtu_util

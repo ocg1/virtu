@@ -2,4 +2,4 @@
  ((names (hedger livesim logobs pnlsim poloarb simu virtu))
   (public_names (hedger livesim logobs pnlsim poloarb simu virtu))
   (preprocess (pps (ppx_sexp_conv ppx_bin_prot ppx_compare ppx_hash)))
-  (libraries (bs-api dtc ocamlgraph leveldb))))
+  (libraries (tick bs-api ocamlgraph leveldb))))

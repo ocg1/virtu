@@ -2,8 +2,6 @@ open Core
 open Async
 open Log.Global
 
-open Dtc
-
 open Bs_devkit
 
 type trade = { price: int; qty: int; side: [`Buy | `Sell] } [@@deriving sexp]

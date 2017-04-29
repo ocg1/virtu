@@ -4,7 +4,6 @@ open Core
 open Async
 open Log.Global
 
-open Dtc
 open Virtu_util
 open Bs_devkit
 open Bs_api.BMEX
