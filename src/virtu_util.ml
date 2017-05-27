@@ -1,22 +1,12 @@
 open Core
 open Async
 
-(* open Dtc *)
 open Bs_devkit
-open Bs_api.BMEX
-
-module Side = struct
-  type t = [`Buy | `Sell]
-
-  let to_bitmex_string = function
-  | `Buy -> "Buy"
-  | `Sell -> "Sell"
-
-  let pp_bitmex ppf side =
-    Format.fprintf ppf "%s" (to_bitmex_string side)
-end
 
 module Order = struct
+  open Bmex
+  module R = Bmex_rest
+
   type cfg = {
     dry_run: bool ;
     current_bids: RespObj.t String.Table.t ;
@@ -43,49 +33,57 @@ module Order = struct
   | _ -> invalid_arg "oid_of_respobj"
 
   let position cfg =
-    Rest.Position.position ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret ()
+    R.position ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret ()
 
   let submit ?buf cfg orders =
     if orders = [] then Deferred.Or_error.error_string "submit: empty orders"
     else if cfg.dry_run then Deferred.Or_error.return (`List orders)
     else
-    Rest.Order.submit ?buf ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders >>| function
+    R.submit_order ?buf ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders >>| function
     | Ok res ->
       List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
         let sym = RespObj.string_exn o "symbol" in
-        let side = Option.value_exn (RespObj.string_exn o "side" |> side_of_bmex) in
-        let current_table = match side with `Buy -> cfg.current_bids | `Sell -> cfg.current_asks in
-        String.Table.set current_table sym o
-      end;
+        let side = RespObj.string_exn o "side" |> Side.of_string in
+        match side with
+        | None -> ()
+        | Some `Buy -> String.Table.set cfg.current_bids sym o
+        | Some `Sell -> String.Table.set cfg.current_asks sym o
+      end ;
       Ok res
     | Error err ->
       List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
         let sym = RespObj.string_exn o "symbol" in
-        let side = Option.value_exn (RespObj.string_exn o "side" |> side_of_bmex) in
-        let current_table = match side with `Buy -> cfg.current_bids | `Sell -> cfg.current_asks in
-        String.Table.remove current_table sym;
-      end;
+        let side = RespObj.string_exn o "side" |> Side.of_string in
+        match side with
+        | None -> ()
+        | Some `Buy -> String.Table.remove cfg.current_bids sym
+        | Some `Sell -> String.Table.remove cfg.current_asks sym
+      end ;
       Error err
 
   let update cfg orders =
+    let update_table table sym o =
+      String.Table.update table sym ~f:begin function
+      | Some old_o -> RespObj.merge old_o o
+      | None -> o
+      end in
     if orders = [] then Deferred.Or_error.error_string "update: empty orders"
     else if cfg.dry_run then
       Deferred.Or_error.return (`List orders)
     else
-    Bs_api.BMEX.Rest.Order.update ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders  >>| function
+    R.update_order ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders  >>| function
     | Error err -> Error err
     | Ok res -> List.iter orders ~f:begin fun o ->
         let o = RespObj.of_json o in
         let sym = RespObj.string_exn o "symbol" in
-        let side = Option.value_exn (RespObj.string_exn o "side" |> side_of_bmex) in
-        let current_table = match side with `Buy -> cfg.current_bids | `Sell -> cfg.current_asks in
-        String.Table.update current_table sym ~f:begin function
-          | Some old_o -> RespObj.merge old_o o
-          | None -> o
-        end
-      end;
+        let side = RespObj.string_exn o "side" |> Side.of_string in
+        match side with
+        | None -> ()
+        | Some `Buy -> update_table cfg.current_bids sym o
+        | Some `Sell -> update_table cfg.current_asks sym o
+      end ;
       Ok res
 
   let cancel_all ?symbol ?filter cfg =
@@ -95,13 +93,13 @@ module Order = struct
       Deferred.Or_error.return `Null
     end
     else
-    Rest.Order.cancel_all ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret ?symbol ?filter ()
+    R.cancel_all_orders ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret ?symbol ?filter ()
 
   let cancel_all_after cfg timeout =
     if cfg.dry_run then
       Deferred.Or_error.return `Null
     else
-    Rest.Order.cancel_all_after ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret timeout
+    R.cancel_all_orders_after ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret timeout
 end
 
 type best_price_kind = Best | Vwap
@@ -139,12 +137,12 @@ let book_add_qty book price qty =
     | Some oldq -> oldq + qty)
 
 let book_modify_qty ?(allow_empty=false) book price qty =
-  Int.Map.change book price ~f:(function
-    | None -> if allow_empty then Some qty else invalid_arg "book_modify_qty"
-    | Some oldq ->
-      let newq = oldq + qty in
-      if newq > 0 then Some newq else None
-    )
+  Int.Map.change book price ~f:begin function
+  | None -> if allow_empty then Some qty else invalid_arg "book_modify_qty"
+  | Some oldq ->
+    let newq = oldq + qty in
+    if newq > 0 then Some newq else None
+  end
 
 let best_of_side = function
 | `Buy -> Int.Map.max_elt
@@ -175,7 +173,7 @@ let mk_new_limit_order ~symbol ~ticksize ~side ~price ~qty uuid_str =
   `Assoc [
     "clOrdID", `String uuid_str;
     "symbol", `String symbol;
-    "side", `String (Side.to_bitmex_string side);
+    "side", `String (Bmex.Side.to_string side);
     "price", `Float (float_of_satoshis symbol ticksize price);
     "orderQty", `Int qty;
     "execInst", `String "ParticipateDoNotInitiate"
@@ -184,7 +182,7 @@ let mk_new_limit_order ~symbol ~ticksize ~side ~price ~qty uuid_str =
 let mk_amended_limit_order ?price ?qty ~symbol ~side ~ticksize orig oid =
   `Assoc (List.filter_opt [
       Some ("symbol", `String symbol);
-      Some ("side", `String (Side.to_bitmex_string side));
+      Some ("side", `String (Bmex.Side.to_string side));
       Some ((match orig with `S -> "orderID" | `C -> "clOrdID"), `String oid);
       Option.map qty ~f:(fun qty -> "leavesQty", `Int qty);
       Option.map price ~f:(fun price -> "price", `Float (float_of_satoshis symbol ticksize price));

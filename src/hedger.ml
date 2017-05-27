@@ -6,17 +6,16 @@ open Log.Global
 
 open Virtu_util
 open Bs_devkit
-open Bs_api
 
 let log_bfx = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 
 let bfx_key = ref ""
 let bfx_secret = ref @@ Cstruct.of_string ""
 
-let channels : BFX.Ws.Msg.chan_descr Int.Table.t = Int.Table.create ()
+let channels : Bfx_ws.Msg.chan_descr Int.Table.t = Int.Table.create ()
 let subscriptions : int String.Table.t = String.Table.create ()
 
-let bfx_positions : BFX.Ws.Priv.Position.t String.Table.t = String.Table.create ()
+let bfx_positions : Bfx_ws.Priv.Position.t String.Table.t = String.Table.create ()
 let bfx_hb = ref Time_ns.epoch
 
 let maybe_hedge p = ()
@@ -40,7 +39,7 @@ let tickups_w = ref None
 
 let on_bfx_book_partial sym os =
   let orders = String.Table.find_exn bfx_orders sym in
-  let fold_f (bids, asks) { BFX.Ws.Book.Raw.id; price; amount } =
+  let fold_f (bids, asks) { Bfx_ws.Book.Raw.id; price; amount } =
     let price = satoshis_int_of_float_exn price in
     let qty = bps_int_of_float_exn amount in
     (* Log.debug log_bfx "%d %d %d" id price qty; *)
@@ -48,11 +47,17 @@ let on_bfx_book_partial sym os =
     match Int.sign qty with
     | Zero -> invalid_arg "on_bfx_book_partial"
     | Pos ->
-      let new_bids = Int.Map.update bids price ~f:(Option.value_map ~default:qty ~f:(fun old_qty -> old_qty + qty)) in
+      let new_bids =
+        Int.Map.update bids price ~f:begin
+          Option.value_map ~default:qty ~f:(fun old_qty -> old_qty + qty)
+        end in
       new_bids, asks
     | Neg ->
       let qty = Int.neg qty in
-      let new_asks = Int.Map.update asks price ~f:(Option.value_map ~default:qty ~f:(fun old_qty -> old_qty + qty)) in
+      let new_asks =
+        Int.Map.update asks price ~f:begin
+          Option.value_map ~default:qty ~f:(fun old_qty -> old_qty + qty)
+        end in
       bids, new_asks
   in
   let bids, asks = List.fold_left os ~init:(Int.Map.empty, Int.Map.empty) ~f:fold_f in
@@ -74,7 +79,7 @@ let compute_vwaps sym side vwaps old_book new_book =
   | Some old_best, Some new_best, Some (old_vwap, _) when old_best <> new_best || old_vwap <> new_vwap ->
     if old_best <> new_best then
       Log.debug log_bfx "-> tickup %s %s %d %d"
-        sym (Side.to_bitmex_string side)
+        sym (Bmex.Side.to_string (side :> Bmex.Side.t))
         (new_best / 1_000_000) (new_vwap / 1_000_000);
     Option.iter !tickups_w ~f:begin fun p -> try
       let open Protocols.OrderBook in
@@ -85,7 +90,7 @@ let compute_vwaps sym side vwaps old_book new_book =
   | _ -> ()
   end
 
-let on_bfx_book_update sym { BFX.Ws.Book.Raw.id; price = new_price; amount = new_qty } =
+let on_bfx_book_update sym { Bfx_ws.Book.Raw.id; price = new_price; amount = new_qty } =
   let orders = String.Table.find_exn bfx_orders sym in
   let side, books, vwaps = match Float.sign_exn new_qty with
     | Zero -> invalid_arg "on_book_update"
@@ -118,32 +123,27 @@ let on_bfx_book_update sym { BFX.Ws.Book.Raw.id; price = new_price; amount = new
 let subscribe_r, subscribe_w = Pipe.create ()
 
 let bfx_ws buf =
-  let open BFX in
   let on_ws_msg msg =
     let now = Time_ns.now () in
-    match Ws.Ev.of_yojson msg with
-    | Ok {Ws.Ev.name = "subscribed"; fields } ->
+    match Bfx_ws.Ev.of_yojson msg with
+    | Ok {Bfx_ws.Ev.name = "subscribed"; fields } ->
       let channel = String.Map.find_exn fields "channel" in
       let pair = String.Map.find_exn fields "pair" in
       let chanId = String.Map.find_exn fields "chanId" in
       begin match channel, pair, chanId with
-        | `String c, `String p, `Int chanId ->
-          let data =
-            Ws.Msg.(create_chan_descr
-                      ~chan:(channel_of_string c)
-                      ~pair:p ()
-                   )
-          in
-          Int.Table.set channels ~key:chanId ~data;
-        | #Yojson.Safe.json, #Yojson.Safe.json, #Yojson.Safe.json ->
-          invalid_arg "wrong subscribed msg received"
+      | `String c, `String pair, `Int chanId ->
+        let open Bfx_ws.Msg in
+        let data = create_chan_descr ~chan:(channel_of_string c) ~pair in
+        Int.Table.set channels ~key:chanId ~data;
+      | #Yojson.Safe.json, #Yojson.Safe.json, #Yojson.Safe.json ->
+        invalid_arg "wrong subscribed msg received"
       end
-    | Ok { Ws.Ev.name; fields } -> ()
+    | Ok { Bfx_ws.Ev.name; fields } -> ()
     | Error _ ->
-      match Ws.Msg.of_yojson msg with
-      | { Ws.Msg.chan; msg = [`String "hb"] } -> bfx_hb := now
+      match Bfx_ws.Msg.of_yojson msg with
+      | { chan; msg = [`String "hb"] } -> bfx_hb := now
       | { chan = 0; msg = (`String typ) :: tl } -> begin
-          let msg_type, update_type = Ws.Priv.types_of_msg typ in
+          let msg_type, update_type = Bfx_ws.Priv.types_of_msg typ in
           let tl = match tl with
             | [] -> []
             | [`List []] -> []
@@ -152,11 +152,11 @@ let bfx_ws buf =
             | #Yojson.Safe.json :: _ ->
               invalid_arg "client_ws: on_ws_msg: got unexpected msg payload"
           in
-          Ws.Priv.(Log.debug log_bfx "<- %s %s" (show_msg_type msg_type) (show_update_type update_type));
+          (* Ws.Priv.(Log.debug log_bfx "<- %s %s" (show_msg_type msg_type) (show_update_type update_type)); *)
           match msg_type, update_type with
           | Position, _ ->
             List.iter tl ~f:(fun json ->
-                let p = Ws.Priv.Position.of_yojson json in
+                let p = Bfx_ws.Priv.Position.of_yojson json in
                 String.Table.set bfx_positions ~key:p.pair ~data:p;
               )
           | _msg_type, _update_type -> ()
@@ -169,10 +169,10 @@ let bfx_ws buf =
             | (`List msg') :: _ ->
               List.map msg'
                 ~f:(function
-                    | `List update -> Ws.Book.Raw.of_yojson update
+                    | `List update -> Bfx_ws.Book.Raw.of_yojson update
                     | #Yojson.Safe.json -> invalid_arg "update")
             | _ ->
-              [Ws.Book.Raw.of_yojson msg]
+              [Bfx_ws.Book.Raw.of_yojson msg]
           in
           let sym = of_remote_sym pair in
           begin match updates with
@@ -182,7 +182,7 @@ let bfx_ws buf =
           end
         | _ -> ()
   in
-  let ws = Ws.open_connection
+  let ws = Bfx_ws.open_connection
       ~log:(Lazy.force log)
       ~auth:(!bfx_key, !bfx_secret)
       ~to_ws:subscribe_r () in
@@ -197,11 +197,11 @@ let subscribe sym xbt_v =
   String.Table.set bfx_bids sym (Int.Map.empty);
   String.Table.set bfx_asks sym (Int.Map.empty);
   Pipe.write_without_pushback subscribe_w @@
-  BFX.Ws.Ev.create "subscribe"
+  Bfx_ws.Ev.create "subscribe"
     ["channel", `String "book";
      "pair", `String (to_remote_sym sym);
      "prec", `String "R0"
-    ] ()
+    ]
 
 let push_initial_tickers w side symbol =
   let best_f = match side with

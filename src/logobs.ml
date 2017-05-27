@@ -2,8 +2,8 @@ open Core
 open Async
 open Log.Global
 
-(* open Dtc *)
 open Bs_devkit
+module Yojson_encoding = Json_encoding.Make(Json_repr.Yojson)
 
 let bmex_dbs = String.Table.create ()
 let plnx_dbs = String.Table.create ()
@@ -27,71 +27,72 @@ let make_store () =
     LevelDB.put ?sync db key @@ Bigbuffer.contents buf
 
 module BMEX = struct
-  open Bs_api.BMEX
+  open Bmex
+  open Bmex_ws
 
-  let update_of_l2 { OrderBook.L2.id; side; size; price } =
-    let side = Option.value_exn (side_of_bmex side) in
+  let update_of_l2 { OrderBook.L2.id ; side ; size ; price } =
     let price = Option.value_map price ~default:0 ~f:satoshis_int_of_float_exn in
     let qty = Option.value ~default:0 size in
-    DB.{ side ; price ; qty }
+    match side with
+    | Some `Buy ->  Some DB.{ side = `Buy ; price ; qty }
+    | Some `Sell -> Some DB.{ side = `Sell ; price ; qty }
+    | None -> None
 
-  let trade_of_bmex { Trade.symbol; timestamp; side; price; size } =
-    let side = Option.value_exn (side_of_bmex side) in
+  let trade_of_bmex { Trade.symbol ; timestamp = ts ; side ; price ; size } =
     let price = satoshis_int_of_float_exn price in
-    let ts = Time_ns.of_string timestamp in
-    DB.{ ts ; side ; price ; qty = size }
+    match side with
+    | Some `Buy -> Some DB.(Trade { ts ; side = `Buy ; price ; qty = size })
+    | Some `Sell -> Some DB.(Trade { ts ; side = `Sell ; price ; qty = size })
+    | None -> None
 
   let evt_of_update_action up = function
-  | OB.Partial | Insert | Update -> DB.BModify up
+  | Response.Update.Partial | Insert | Update -> DB.BModify up
   | Delete -> BRemove up
 
   let make_on_evt () =
     let store = make_store () in
-    let open Bs_api.BMEX in
     fun kind action data ->
       let now = Time_ns.(now () |> Time_ns.to_int_ns_since_epoch) in
       match kind with
       | `L2 ->
         (* debug "<- %s" (Yojson.Safe.to_string (`List data)); *)
-        let data = List.map data ~f:(Fn.compose Result.ok_or_failwith OrderBook.L2.of_yojson) in
+        let data = List.map data ~f:(Yojson_encoding.destruct OrderBook.L2.encoding) in
         let groups = List.group data ~break:(fun u u' -> u.symbol <> u'.symbol) in
         let iter_f = function
         | [] -> ()
         | { OrderBook.L2.symbol } :: t as ups ->
           let db = String.Table.find_exn bmex_dbs symbol in
-          let data = List.map ups ~f:(fun u -> update_of_l2 u |> fun u -> evt_of_update_action u action) in
+          let data = List.filter_map ups ~f:begin fun u ->
+              update_of_l2 u |>
+              Option.map ~f:(fun u -> evt_of_update_action u action)
+            end in
           debug "%s" (DB.sexp_of_t_list data |> Sexp.to_string);
           store db now data
         in
         List.iter groups ~f:iter_f
       | `Trade ->
-        let data = List.map data ~f:(Fn.compose Result.ok_or_failwith Trade.of_yojson) in
+        let data = List.map data ~f:(Yojson_encoding.destruct Trade.encoding) in
         let iter_f t =
           let db = String.Table.find_exn bmex_dbs t.Trade.symbol in
-          let data = List.map data ~f:(fun t -> DB.Trade (trade_of_bmex t)) in
+          let data = List.filter_map data ~f:trade_of_bmex in
           debug "%s" (DB.sexp_of_t_list data |> Sexp.to_string);
           store db now data
         in
         List.iter data ~f:iter_f
 
   let record symbols =
-    let open Bs_api.BMEX in
     let topics = List.(map symbols ~f:(fun s -> ["orderBookL2:" ^ s; "trade:" ^ s]) |> concat) in
     let on_evt = make_on_evt () in
-    let ws = Ws.open_connection ~md:false ~testnet:false ~topics () in
+    let ws = open_connection ~md:false ~testnet:false ~topics () in
     let on_ws_msg msg_json =
-      match Ws.update_of_yojson msg_json with
-      | Error _ -> begin
-          match Ws.response_of_yojson msg_json with
-          | Error _ -> error "%s" (Yojson.Safe.to_string msg_json)
-          | Ok response -> info "%s" @@ Ws.show_response response
-        end
-      | Ok { table; action; data } ->
-        let action = update_action_of_string action in
+      match Yojson_encoding.destruct Response.encoding msg_json with
+      | Update { table; action; data } -> begin
         match table with
         | "orderBookL2" -> on_evt `L2 action data
         | "trade" -> on_evt `Trade action data
         | _ -> error "Invalid table %s" table
+      end
+      | _ -> ()
     in
     Monitor.handle_errors
       (fun () -> Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg)
@@ -99,7 +100,8 @@ module BMEX = struct
 end
 
 module PLNX = struct
-  open Bs_api.PLNX
+  module Rest = Plnx_rest
+  open Plnx_ws
 
   let polo_of_symbol = function
   | "ETHXBT" -> "BTC_ETH"
@@ -114,7 +116,7 @@ module PLNX = struct
     let symbols_of_sub_ids = Int.Table.create () in
     let on_ws_msg = function
     | Wamp.Welcome _ ->
-      Ws.Msgpck.subscribe to_ws_w syms_polo >>| fun reqids ->
+      M.subscribe to_ws_w syms_polo >>| fun reqids ->
       symbols_of_req_ids := Option.value_exn ~message:"Ws.subscribe" (List.zip reqids symbols)
     | Subscribed { reqid; id } ->
       let sym = List.Assoc.find_exn ~equal:Int.(=) !symbols_of_req_ids reqid in
@@ -122,42 +124,39 @@ module PLNX = struct
       Int.Table.set symbols_of_sub_ids id sym;
       let db = String.Table.find_exn plnx_dbs sym in
       let rec loop () =
-        Rest.books ~symbol:sym_polo () >>= function
-        | Ok books ->
-          let { Rest.asks; bids; seq } =
-            List.Assoc.find_exn ~equal:String.(=) books sym_polo in
+        Rest.books sym_polo >>= function
+        | Ok { Rest.Books.asks; bids; seq } ->
           let evts = List.map (bids @ asks) ~f:(fun evt -> DB.BModify evt) in
           store db seq evts;
           info "stored %d %s partial" (List.length evts) sym;
           Deferred.unit
         | Error err ->
-          error "%s" (Error.to_string_hum err);
+          error "%s" (Plnx_rest.Http_error.to_string err);
           Clock_ns.after @@ Time_ns.Span.of_int_sec 10 >>=
           loop
       in
       don't_wait_for @@ loop ();
       debug "subscribed %s" sym;
       Deferred.unit
-    | Event { Wamp.pubid; subid; details; args; kwArgs } ->
+    | Event { pubid; subid; details; args; kwArgs } ->
       let sym = Int.Table.find_exn symbols_of_sub_ids subid in
       let db = String.Table.find_exn plnx_dbs sym in
       let seq = match List.Assoc.find_exn ~equal:String.(=) kwArgs "seq" with
       | Msgpck.Int i -> i
       | _ -> failwith "seq" in
       let map_f msg =
-        let open Ws.Msgpck in
         match of_msgpck msg with
         | Error msg -> failwith msg
         | Ok { typ="newTrade"; data } ->
-          let trade = trade_of_msgpck data in
+          let trade = M.read_trade data in
           debug "%d T %s" seq @@ Fn.compose Sexp.to_string  DB.sexp_of_trade trade;
           DB.Trade trade
         | Ok { typ="orderBookModify"; data } ->
-          let update = book_of_msgpck data in
+          let update = M.read_book data in
           debug "%d M %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
           DB.BModify update
         | Ok { typ="orderBookRemove"; data } ->
-          let update = book_of_msgpck data in
+          let update = M.read_book data in
           debug "%d D %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
           DB.BRemove update
         | Ok { typ } -> failwithf "unexpected message type %s" typ ()
@@ -168,7 +167,7 @@ module PLNX = struct
       (* error "unknown message: %s" (Wamp.sexp_of_msg Msgpck.sexp_of_t msg |> Sexplib.Sexp.to_string); *)
       Deferred.unit
     in
-    let ws = Ws.open_connection to_ws in
+    let ws = open_connection to_ws in
     Monitor.handle_errors
       (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
       (fun exn -> error "%s" @@ Exn.to_string exn)

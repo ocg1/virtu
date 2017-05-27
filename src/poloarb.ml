@@ -2,9 +2,7 @@ open Core
 open Async
 open Log.Global
 
-(* open Dtc.Dtc *)
 open Bs_devkit
-open Bs_api.PLNX
 open Graph
 
 module CycleTbl = Hashtbl.Make (struct
@@ -116,6 +114,7 @@ let currs_of_symbol sym =
   | _ -> invalid_argf "currs_of_symbol: %s" sym ()
 
 let execute_arbitrage ?(dry_run=true) ?buf cycle =
+
   let iter_f (c1, _, c2) =
     let symbol = symbol_of_currs c1 c2 in
     let symbol, inverted =
@@ -143,20 +142,22 @@ let execute_arbitrage ?(dry_run=true) ?buf cycle =
           pricef';
         Deferred.unit
       | false ->
-        Rest.order ?buf ~key:!key ~secret:!secret
+        Plnx_rest.order ?buf ~key:!key ~secret:!secret
           ~side:`Buy  ~tif:`Fill_or_kill ~symbol
-          ~price:(satoshis_int_of_float_exn price)
-          ~qty:(satoshis_int_of_float_exn q2) () >>| fun res ->
-        let { Rest.id; trades; amount_unfilled } = Or_error.ok_exn res in
-        let q1, q2 = List.fold_left trades ~init:(0., 0.) ~f:begin fun (q1, q2) { gid; id; trade={ ts; side; price; qty } } ->
-            let price = price // 100_000_000 in
-            let qty = qty // 100_000_000 in
-            q1 -. qty *. price, q2 +. qty
-          end
-        in
-        String.Table.update balances c1 ~f:(function None -> assert false | Some v -> v +. q1);
-        String.Table.update balances c2 ~f:(function None -> assert false | Some v -> v +. q2);
-        info "[Trade] %s (%f) -> %s (%f)" c1 q1 c2 q2;
+          ~price
+          ~qty:q2 () >>| function
+        | Error err -> failwith (Plnx_rest.Http_error.to_string err)
+        | Ok { id; trades; amount_unfilled } ->
+          let q1, q2 =
+            List.fold_left trades
+              ~init:(0., 0.)
+              ~f:begin fun (q1, q2) { ts ; side ; price ; qty } ->
+                q1 -. qty *. price, q2 +. qty
+              end
+          in
+          String.Table.update balances c1 ~f:(function None -> assert false | Some v -> v +. q1);
+          String.Table.update balances c2 ~f:(function None -> assert false | Some v -> v +. q2);
+          info "[Trade] %s (%f) -> %s (%f)" c1 q1 c2 q2
   in
   match CycleTbl.find cycles cycle with
   | Some _ -> Deferred.unit
@@ -257,13 +258,14 @@ let del_entry side symbol ~seq ~price =
     top_changed side asks asks'
 
 let ws buf ws_init ob_initialized =
+  let open Plnx_ws in
   let to_ws, to_ws_w = Pipe.create () in
   let symbols_of_req_ids = ref [] in
   let symbols_of_sub_ids = Int.Table.create () in
   let on_ws_msg = function
   | Wamp.Welcome _ ->
     let symbols = String.Table.keys books in
-    Ws.Msgpck.subscribe to_ws_w @@ symbols >>| fun reqids ->
+    Plnx_ws.M.subscribe to_ws_w @@ symbols >>| fun reqids ->
     symbols_of_req_ids := Option.value_exn ~message:"Ws.subscribe" (List.zip reqids symbols)
   | Subscribed { reqid; id } ->
     let sym = List.Assoc.find_exn ~equal:Int.(=) !symbols_of_req_ids reqid in
@@ -271,7 +273,7 @@ let ws buf ws_init ob_initialized =
     debug "subscribed %s" sym;
     if Int.Table.length symbols_of_sub_ids = String.Table.length books then Ivar.fill_if_empty ws_init ();
     Deferred.unit
-  | Event { Wamp.pubid; subid; details; args; kwArgs } ->
+  | Event { pubid; subid; details; args; kwArgs } ->
     let symbol = Int.Table.find_exn symbols_of_sub_ids subid in
     let { quote; base } = String.Table.find_exn currs symbol in
     if not @@ String.Set.mem !arbitrable_symbols base then Deferred.unit else
@@ -279,19 +281,18 @@ let ws buf ws_init ob_initialized =
     | Msgpck.Int i -> i
     | _ -> failwith "seq" in
     let iter_f msg =
-      let open Ws.Msgpck in
       match of_msgpck msg with
       | Error msg -> failwith msg
       | Ok { typ="newTrade"; data } ->
-        let trade = trade_of_msgpck data in
+        let trade = M.read_trade data in
         debug "%s %d T %s" symbol seq @@ Fn.compose Sexp.to_string DB.sexp_of_trade trade;
       | Ok { typ="orderBookModify"; data } ->
-        let ({ side; price; qty } as update): DB.book_entry = book_of_msgpck data in
+        let ({ side; price; qty } as update): DB.book_entry = M.read_book data in
         debug "%s %d M %s" symbol seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
         let _changed = set_entry ~symbol ~side ~seq ~price ~qty in
         if !ob_initialized then find_negative_cycle ~symbol ~threshold:!threshold
       | Ok { typ="orderBookRemove"; data } ->
-        let ({ side; price; qty } as update): DB.book_entry = book_of_msgpck data in
+        let ({ side; price; qty } as update): DB.book_entry = M.read_book data in
         debug "%s %d D %s" symbol seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
         let _changed = del_entry side symbol ~seq ~price in
         if !ob_initialized then find_negative_cycle ~symbol ~threshold:!threshold
@@ -303,14 +304,15 @@ let ws buf ws_init ob_initialized =
     (* error "unknown message: %s" (Wamp.sexp_of_msg Msgpck.sexp_of_t msg |> Sexplib.Sexp.to_string); *)
     Deferred.unit
   in
-  let ws = Ws.open_connection to_ws in
+  let ws = Plnx_ws.open_connection to_ws in
   Monitor.handle_errors
     (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
     (fun exn -> error "%s" @@ Exn.to_string exn)
 
-let load_books ?depth buf =
-  Deferred.Or_error.ok_exn (Rest.books ~buf ?depth ()) >>| fun bs ->
-  List.iter bs ~f:begin fun (symbol, { asks; bids; isFrozen; seq }) ->
+let load_books_for_symbol ?depth buf symbol =
+  Plnx_rest.books ~buf ?depth symbol >>| function
+  | Error err -> ()
+  | Ok { asks; bids; isFrozen; seq } ->
     let bids =
       List.fold_left bids ~init:Int.Map.empty ~f:begin fun a { side; price; qty } ->
         Int.Map.add a ~key:price ~data:{ qty; seq }
@@ -322,20 +324,17 @@ let load_books ?depth buf =
       end
     in
     String.Table.set books symbol { bids; asks }
-  end;
-  info "Loaded %d books" @@ List.length bs
 
-let update_books ?depth buf =
-  Deferred.Or_error.ok_exn (Rest.books ~buf ?depth ()) >>| fun bs ->
-  List.iter bs ~f:begin fun (symbol, { asks; bids; isFrozen; seq }) ->
+let update_books_for_symbol ?depth buf symbol =
+  Plnx_rest.books ~buf ?depth symbol >>| function
+  | Error _ -> ()
+  | Ok { asks; bids; isFrozen; seq } ->
     List.iter bids ~f:begin fun { side; price; qty } ->
       let (_:bool) = set_entry ~symbol ~side ~price ~qty ~seq in ()
     end;
     List.iter asks ~f:begin fun { side; price; qty } ->
       let (_:bool) = set_entry ~symbol ~side ~price ~qty ~seq in ()
-    end;
-  end;
-  info "Updated %d books" @@ List.length bs
+    end
 
 let select_vertices syms =
   let btc, eth, xmr, usdt =
@@ -374,24 +373,30 @@ let main cfg daemon pidfile logfile loglevel fees' min_qty () =
     key := cfg.key;
     secret := Cstruct.of_string cfg.secret;
     info "poloarb starting";
-    Deferred.Or_error.ok_exn (Rest.balances ~buf ~key:!key ~secret:!secret ()) >>= fun bs ->
-    List.iter bs ~f:begin fun (symbol, { available; on_orders; btc_value }) ->
-      if symbol = "BTC" then info "%s balance %d XBt" symbol available;
-      String.Table.set balances ~key:symbol ~data:(available // 100_000_000)
-    end;
-    info "Loaded %d balances" @@ List.length bs;
-    Deferred.Or_error.ok_exn (Rest.symbols ~buf ()) >>= fun syms ->
-    let vs = select_vertices syms in
-    arbitrable_symbols := vs;
-    info "Currencies %s" (String.Set.sexp_of_t vs |> Sexplib.Sexp.to_string);
-    String.Set.iter vs ~f:(G.add_vertex g);
-    load_books ~depth:0 buf >>= fun () ->
-    let ob_initialized = ref false in
-    let ws_t = ws buf ws_init ob_initialized in
-    Ivar.read ws_init >>= fun () ->
-    update_books buf >>= fun () ->
-    ob_initialized := true;
-    ws_t
+    Plnx_rest.balances ~buf ~key:!key ~secret:!secret () >>= function
+    | Error _ -> Deferred.unit
+    | Ok bs ->
+      List.iter bs ~f:begin fun (symbol, { available; on_orders; btc_value }) ->
+        if symbol = "BTC" then info "%s balance %f XBt" symbol available;
+        String.Table.set balances ~key:symbol ~data:available
+      end;
+      info "Loaded %d balances" @@ List.length bs;
+      Plnx_rest.symbols ~buf () >>= function
+      | Error _ -> Deferred.unit
+      | Ok syms ->
+        let vs = select_vertices syms in
+        arbitrable_symbols := vs;
+        info "Currencies %s" (String.Set.sexp_of_t vs |> Sexplib.Sexp.to_string);
+        String.Set.iter vs ~f:(G.add_vertex g);
+        Deferred.List.iter
+          ~how:`Parallel syms ~f:(load_books_for_symbol ~depth:0 buf) >>= fun () ->
+        let ob_initialized = ref false in
+        let ws_t = ws buf ws_init ob_initialized in
+        Ivar.read ws_init >>= fun () ->
+        Deferred.List.iter
+          ~how:`Parallel syms ~f:(update_books_for_symbol buf) >>= fun () ->
+        ob_initialized := true;
+        ws_t
   end
 
 let command =

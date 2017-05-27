@@ -6,8 +6,8 @@ open Log.Global
 
 open Virtu_util
 open Bs_devkit
-open Bs_api.BMEX
-module B = Bs_api.BMEX
+
+module Yojson_encoding = Json_encoding.Make(Json_repr.Yojson)
 
 let log_ws = Log.(create ~level:`Error ~on_error:`Raise ~output:[Output.stderr ()])
 
@@ -124,7 +124,7 @@ let compute_orders ?order symbol side price newQty =
   let ticksize = String.Table.find_exn ticksizes symbol in
   let leavesQtySexp = Option.sexp_of_t Int.sexp_of_t leavesQty |> Sexp.to_string_hum in
   debug "compute_orders %s %s %d %s %d" symbol
-    (Side.to_bitmex_string side)
+    (Bmex.Side.to_string side)
     (price / ticksize.divisor) leavesQtySexp newQty;
   match leavesQty with
   | None when newQty > 0 ->
@@ -208,16 +208,15 @@ let on_instrument action data =
     String.Table.set instruments ~key:sym ~data:(RespObj.merge oldInstr i)
   in
   begin match action with
-  | OB.Partial ->
+  | Bmex_ws.Response.Update.Partial ->
     List.iter data ~f:on_partial_insert;
     Ivar.fill_if_empty instruments_initialized ()
   | Insert -> List.iter data ~f:on_partial_insert
   | Update -> List.iter data ~f:on_update
-  | _ -> error "instrument: got action %s" (OB.sexp_of_action action |> Sexp.to_string)
+  | _ -> ()
   end
 
-let update_depth action old_book { B.OrderBook.L2.symbol; id; side = side_str; price = new_price; size = new_qty } =
-  let action_str = OB.sexp_of_action action |> Sexp.to_string in
+let update_depth action old_book { Bmex.OrderBook.L2.symbol; id; side ; price = new_price; size = new_qty } =
   let orders = String.Table.find_exn OrderBook.orders symbol in
   let old_order = Int.Table.find orders id in
   let old_price = Option.map old_order ~f:(fun { price } -> price) in
@@ -232,9 +231,9 @@ let update_depth action old_book { B.OrderBook.L2.symbol; id; side = side_str; p
   | Some oldq, None -> oldq
   | _ -> failwithf "update_depth: missing old OB entry" ()
   in
-  debug "[OB] %s %s %s %d %d" action_str symbol side_str new_price new_qty;
+  (* debug "[OB] %s %s %s %d %d" action_str symbol (Bmex.Side.show side) new_price new_qty; *)
   match action, old_price, old_qty, new_price, new_qty with
-  | OB.Delete, Some oldp, Some oldq, _, _ ->
+  | Bmex_ws.Response.Update.Delete, Some oldp, Some oldq, _, _ ->
     Int.Table.remove orders id;
     book_modify_qty old_book oldp (Int.neg oldq)
   | Partial, None, None, newp, newq
@@ -250,23 +249,23 @@ let update_depth action old_book { B.OrderBook.L2.symbol; id; side = side_str; p
     book_modify_qty ~allow_empty:true intermediate_book newp newq
   | _ ->
     failwithf "update_depth: %s %d %d %d %d"
-      action_str
+      (Bmex_ws.Response.Update.show_action action)
       (Option.value ~default:Int.max_value old_price)
       (Option.value ~default:Int.max_value old_qty)
       new_price new_qty ()
 
 let on_orderbook action data =
   (* debug "<- %s" (Yojson.Safe.to_string (`List data)); *)
-  let data = List.map data ~f:(Fn.compose Result.ok_or_failwith B.OrderBook.L2.of_yojson) in
+  let data = List.map data ~f:(Yojson_encoding.destruct Bmex.OrderBook.L2.encoding) in
   let data = List.group data ~break:(fun u u' -> u.symbol <> u'.symbol || u.side <> u'.side) in
   let iter_f = function
-  | (h :: t) as us when String.Table.mem quoted_instruments h.B.OrderBook.L2.symbol ->
-    let side, best_elt_f, books, vwaps = match side_of_bmex h.side with
-    | None -> failwith "buy_sell_of_bmex"
+  | (h :: t) as us when String.Table.mem quoted_instruments h.Bmex.OrderBook.L2.symbol ->
+    let side, best_elt_f, books, vwaps = match h.side with
     | Some `Buy -> `Buy, Int.Map.max_elt, OrderBook.bids, OrderBook.bid_vwaps
     | Some `Sell -> `Sell, Int.Map.min_elt, OrderBook.asks, OrderBook.ask_vwaps
+    | _ -> invalid_arg "on_orderbook: side unset"
     in
-    let old_book = if action = OB.Partial then Int.Map.empty else
+    let old_book = if action = Bmex_ws.Response.Update.Partial then Int.Map.empty else
       String.Table.find_exn books h.symbol
     in
     let new_book = List.fold_left us ~init:old_book ~f:(update_depth action) in
@@ -285,7 +284,7 @@ let on_orderbook action data =
     (* end; *)
 
     if action = Partial then begin
-      debug "[OB] %s %s initialized" h.symbol (Side.to_bitmex_string side);
+      debug "[OB] %s %s initialized" h.symbol (Bmex.Side.to_string side);
       let { bids_initialized; asks_initialized } = String.Table.find_exn quoted_instruments h.symbol in
       match side with
       | `Buy -> Ivar.fill_if_empty bids_initialized ()
@@ -304,8 +303,12 @@ let on_exec es =
     let execType = RespObj.string_exn e "execType" in
     let orderID = RespObj.string_exn e "orderID" in
     let clOrdID = RespObj.string_exn e "clOrdID" in
-    let side = Option.value_exn (RespObj.string_exn e "side" |> side_of_bmex) in
-    let current_table = match side with `Buy -> current_bids | `Sell -> current_asks in
+    let side = RespObj.string_exn e "side" |> Bmex.Side.of_string in
+    let current_table =
+      match side with
+      | None -> invalid_arg "on_exec: side unset"
+      | Some `Buy -> current_bids
+      | Some `Sell -> current_asks in
     if clOrdID <> "" then String.Table.set current_table symbol e;
     debug "[E] %s %s (%s)" symbol execType (String.sub orderID 0 8);
     match execType with
@@ -313,7 +316,11 @@ let on_exec es =
     | "Replaced" -> ()
     | "Trade" ->
       let lastQty = RespObj.int64_exn e "lastQty" |> Int64.to_int_exn in
-      let lastQty = match side with `Buy -> lastQty | `Sell -> Int.neg lastQty in
+      let lastQty =
+        match side with
+        | None -> invalid_arg "on_exec: side unset"
+        | Some `Buy -> lastQty
+        | Some `Sell -> Int.neg lastQty in
       String.Table.update positions symbol ~f:begin function
       | Some qty ->
         don't_wait_for @@ on_position_update symbol qty lastQty;
@@ -333,17 +340,19 @@ let import_positions = function
 | #Yojson.Safe.json -> invalid_arg "import_positions"
 
 let market_make strategy instruments =
-  let on_ws_msg msg = match Ws.msg_of_yojson msg with
-  | Welcome ->
-    info "WS: connected"; Deferred.unit
+  let on_ws_msg msg =
+    let open Bmex_ws in
+    match Yojson_encoding.destruct Response.encoding msg with
+  | Welcome _ ->
+    info "WS: connected";
+    Deferred.unit
   | Error err ->
-    error "BitMEX: error %s" @@ Ws.show_error err; Deferred.unit
-  | Ok { request = { op = "subscribe" }; subscribe; success } ->
-    info "BitMEX: subscribed to %s: %b" subscribe success; Deferred.unit
-  | Ok { success } ->
-    error "BitMEX: unexpected response %s" (Yojson.Safe.to_string msg); Deferred.unit
+    error "BitMEX: error %s" err;
+    Deferred.unit
+  | Response { topic; symbol } ->
+    info "BitMEX: subscribed to %s" (Topic.show topic) ;
+    Deferred.unit
   | Update { table; action; data } ->
-    let action = update_action_of_string action in
     match table with
     | "instrument" -> on_instrument action data; Deferred.unit
     | "orderBookL2" ->
@@ -378,28 +387,24 @@ let market_make strategy instruments =
   don't_wait_for @@ begin feed_initialized >>= fun () ->
     S.update_orders strategy
   end;
-  let ws = Ws.open_connection ~log:log_ws ~testnet:!testnet ~auth:(!api_key, !api_secret) ~md:false ~topics () in
+  let ws = Bmex_ws.open_connection
+      ~log:log_ws ~testnet:!testnet ~auth:(!api_key, !api_secret)
+      ~md:false ~topics () in
   Monitor.handle_errors
     (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
     (fun exn -> error "%s" @@ Exn.to_string exn)
 
 let tickers_of_instrument ?log = function
-| "XBTUSD" ->
-  Pipe.map (Ws.Kaiko.tickers ["bitmex"]) ~f:(fun { index={ bid; ask } } ->
-      Option.iter log ~f:(fun log -> Log.debug log "[T] Kaiko %s %s" bid ask);
-      satoshis_int_of_float_exn @@ Float.of_string bid,
-      satoshis_int_of_float_exn @@ Float.of_string ask
-    )
 | "ETHXBT" ->
-  let open Bs_api.PLNX in
+  let open Plnx_ws in
   let to_ws, to_ws_w = Pipe.create () in
-  let evts = Ws.open_connection to_ws in
+  let evts = open_connection to_ws in
   Pipe.filter_map evts ~f:begin function
   | Wamp.Welcome _ ->
-    don't_wait_for @@ Deferred.ignore @@ Ws.Msgpck.subscribe to_ws_w ["ticker"];
+    don't_wait_for @@ Deferred.ignore @@ M.subscribe to_ws_w ["ticker"];
     None
   | Event { args } ->
-    let { symbol; bid; ask } = Ws.Msgpck.ticker_of_msgpck @@ Msgpck.List args in
+    let { Plnx.Ticker.symbol; bid; ask } = M.read_ticker @@ Msgpck.List args in
     if symbol <> to_remote_sym "ETHXBT" then None
     else begin
       Option.iter log ~f:(fun log -> Log.debug log "[T] PLNX %s %f %f" symbol bid ask);

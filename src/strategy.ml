@@ -2,7 +2,6 @@ open Core
 open Async
 
 open Bs_devkit
-open Bs_api.BMEX
 open Virtu_util
 
 module type Cfg = sig
@@ -16,18 +15,15 @@ module type Cfg = sig
   val ticksizes : ticksize String.Table.t
   val local_best_price :
     ?remove_order:(int * int) ->
-    Side.t -> string -> (int * int) option
+    [`Buy | `Sell] -> string -> (int * int) option
 end
 
 module Common (C : Cfg) = struct
   open C
 
-  let current_working_order symbol side =
+  let current_working_order symbol table =
     let open Option.Monad_infix in
-    let current_orders = match side with
-    | `Buy -> current_bids
-    | `Sell -> current_asks in
-    String.Table.find current_orders symbol >>= fun o ->
+    String.Table.find table symbol >>= fun o ->
     RespObj.int64 o "leavesQty" >>= fun leavesQty ->
     RespObj.bool o "workingIndicator" >>= fun working ->
     if leavesQty > 0L && working then Some o else None
@@ -39,14 +35,17 @@ module Common (C : Cfg) = struct
       let new_price = match dprice with `Abs p -> p | `Diff dp -> old_price + dp in
       if old_price = new_price then None else begin
         Log.info log "update order price %s %s %s %d -> %d"
-          symbol (Side.to_bitmex_string side)
+          symbol (match side with `Buy -> "B" | `Sell -> "S")
           (String.sub oid 0 8)
           (old_price / tickSize) (new_price / tickSize);
         let ticksize = String.Table.find_exn ticksizes symbol in
         Option.some @@ mk_amended_limit_order ~symbol ~side ~ticksize ~price:new_price orig oid
       end
     in
-    Option.Monad_infix.(current_working_order symbol side >>= mk_order)
+    let table = match side with
+    | `Buy -> current_bids
+    | `Sell -> current_asks in
+    Option.Monad_infix.(current_working_order symbol table >>= mk_order)
 end
 
 module Blanket (C : Cfg) = struct
@@ -89,8 +88,8 @@ module Blanket (C : Cfg) = struct
           if Time_ns.Span.(time_elapsed < of_int_ms 1500) then Deferred.unit
           else begin
             latest_update := now;
-            let currentBidOrder = current_working_order symbol `Buy in
-            let currentAskOrder = current_working_order symbol `Sell in
+            let currentBidOrder = current_working_order symbol current_bids in
+            let currentAskOrder = current_working_order symbol current_asks in
             let currentBidPQty = Option.bind currentBidOrder price_qty_of_order in
             let currentAskPQty = Option.bind currentAskOrder price_qty_of_order in
             let newLocBid = local_best_price ?remove_order:currentBidPQty `Buy symbol |> Option.map ~f:fst in
