@@ -38,67 +38,64 @@ let string_of_cycle = string_of_cycle (Buffer.create 128)
 
 let cycles : unit CycleTbl.t = CycleTbl.create ()
 
-type entry = { qty: int; seq: int }
-type book = entry Int.Map.t
+type entry = { qty: Float.t ; seq: int }
+type book = entry Float.Map.t
 type books = { bids: book; asks: book }
 
 let arbitrable_symbols = ref String.Set.empty
 let books : books String.Table.t = String.Table.create ()
 let balances : Float.t String.Table.t = String.Table.create ()
 
-type vwap = { bid: float; bid_qty: int; ask: float; ask_qty: int }
+type vwap = { bid: float; bid_qty: float; ask: float; ask_qty: float }
 let vwaps : vwap String.Table.t = String.Table.create ()
 
 let key = ref ""
 let secret = ref @@ Cstruct.of_string ""
 let fees = ref Float.one
-let threshold = ref 0
+let threshold = ref 0.
 
 let top_changed ~side ~oldb ~newb = match side with
-| `Buy -> Int.Map.max_elt oldb <> Int.Map.max_elt newb
-| `Sell -> Int.Map.min_elt oldb <> Int.Map.min_elt newb
+| `Buy -> Float.Map.max_elt oldb <> Float.Map.max_elt newb
+| `Sell -> Float.Map.min_elt oldb <> Float.Map.min_elt newb
 
 let get_entry ~symbol ~side ~price =
   let book = String.Table.find books symbol in
   Option.bind book ~f:begin fun { bids; asks } ->
-    Int.Map.find (match side with `Buy -> bids | `Sell -> asks) price
+    Float.Map.find (match side with `Buy -> bids | `Sell -> asks) price
   end
 
 let best_entry ~symbol ~side =
   let book = String.Table.find books symbol in
   Option.bind book ~f:begin fun { bids; asks } ->
     match side with
-    | `Buy -> Int.Map.max_elt bids
-    | `Sell -> Int.Map.min_elt asks
+    | `Buy -> Float.Map.max_elt bids
+    | `Sell -> Float.Map.min_elt asks
   end
 
-exception Result of float * int
+exception Result of float * float
 let return_result ~qty ~vwap = raise (Result (vwap, qty))
 
 let vwap ~symbol ~side ~threshold =
   let fold_f_exn ~threshold ~key:price ~data:{ qty } (vwap, oldq) =
     (* info "vwap %s %d %d %d %f %d" symbol price qty oldq vwap threshold; *)
-    let pricef = price // 100_000_000 in
-    if oldq + qty <= threshold
+    if oldq +. qty <= threshold
     then
-      let qtyf = qty // 100_000_000 in
-      vwap +. pricef *. qtyf, oldq + qty
+      vwap +. price *. qty, oldq +. qty
     else
-    let rem_qty = threshold - oldq in
-    let rem_qtyf = rem_qty // 100_000_000 in
-    return_result ~qty:(oldq + rem_qty) ~vwap:(vwap +. pricef *. rem_qtyf)
+    let rem_qty = threshold -. oldq in
+    return_result ~qty:(oldq +. rem_qty) ~vwap:(vwap +. price *. rem_qty)
   in
   let open Option.Monad_infix in
   best_entry ~symbol ~side >>= fun (price, _qty) ->
-  let threshold = ((threshold // price) *. 1e8) |> Int.of_float in
+  let threshold = threshold /. price in
   String.Table.find books symbol >>| fun { bids; asks } ->
   match side with
   | `Buy -> begin try
-      Int.Map.fold_right bids ~init:(0., 0) ~f:(fold_f_exn ~threshold)
+      Float.Map.fold_right bids ~init:(0., 0.) ~f:(fold_f_exn ~threshold)
     with Result (vwap, q) -> (vwap, q)
     end
   | `Sell -> begin try
-      Int.Map.fold asks ~init:(0., 0) ~f:(fold_f_exn ~threshold)
+      Float.Map.fold asks ~init:(0., 0.) ~f:(fold_f_exn ~threshold)
     with Result (vwap, q) -> (vwap, q)
     end
 
@@ -125,8 +122,8 @@ let execute_arbitrage ?(dry_run=true) ?buf cycle =
     | None -> failwithf "No vwaps for %s" symbol ()
     | Some { bid; bid_qty; ask; ask_qty } ->
       let price, qty = match side with
-      | `Buy -> bid, bid_qty // 100_000_000
-      | `Sell -> ask, ask_qty // 100_000_000 in
+      | `Buy -> bid, bid_qty
+      | `Sell -> ask, ask_qty in
       let c1_balance = String.Table.find_exn balances c1 in
       let pricef' = if inverted then 1. /. price else price in
       let q2 = if inverted then qty *. price else qty in
@@ -212,8 +209,8 @@ let find_negative_cycle ~symbol ~threshold =
   let ask = vwap ~symbol ~side:`Sell ~threshold in
   match bid, ask with
   | Some (bpaid, bqty), Some (apaid, aqty) ->
-    let bvwap = bpaid /. (bqty // 100_000_000) in
-    let avwap = apaid /. (aqty // 100_000_000) in
+    let bvwap = bpaid /. bqty in
+    let avwap = apaid /. aqty in
     (* info "find_negative_cycle: %s %f %d %f %d %f %f" symbol bpaid bqty apaid aqty bvwap avwap; *)
     String.Table.set vwaps ~key:symbol ~data:begin
       { bid = bpaid ; bid_qty = bqty ; ask = apaid ; ask_qty = aqty }
@@ -225,34 +222,42 @@ let set_entry ~symbol ~side ~seq ~price ~qty =
   let { bids; asks } = String.Table.find_exn books symbol in
   match side with
   | `Buy ->
-    let bids' = match Int.Map.find bids price with
-    | None -> Int.Map.add bids price { seq; qty }
-    | Some entry -> if entry.seq > seq then bids else Int.Map.add bids price { seq; qty }
+    let bids' =
+      match Float.Map.find bids price with
+      | None -> Float.Map.add bids price { seq; qty }
+      | Some entry ->
+        if entry.seq > seq then bids else Float.Map.add bids price { seq; qty }
     in
     String.Table.set books symbol { bids=bids'; asks };
     top_changed side bids bids'
   | `Sell ->
-    let asks' = match Int.Map.find asks price with
-    | None -> Int.Map.add asks price { seq; qty }
-    | Some entry -> if entry.seq > seq then asks else Int.Map.add asks price { seq; qty }
+    let asks' =
+      match Float.Map.find asks price with
+      | None -> Float.Map.add asks price { seq; qty }
+      | Some entry ->
+        if entry.seq > seq then asks else Float.Map.add asks price { seq; qty }
     in
     String.Table.set books symbol { bids; asks=asks' };
     top_changed side asks asks'
 
-let del_entry side symbol ~seq ~price =
+let del_entry ~symbol ~side ~seq ~price =
   let { bids; asks } = String.Table.find_exn books symbol in
   match side with
   | `Buy ->
-    let bids' = match Int.Map.find bids price with
-    | None -> bids
-    | Some entry -> if entry.seq > seq then bids else Int.Map.remove bids price
+    let bids' =
+      match Float.Map.find bids price with
+      | None -> bids
+      | Some entry ->
+        if entry.seq > seq then bids else Float.Map.remove bids price
     in
     String.Table.set books symbol { bids=bids'; asks };
     top_changed side bids bids'
   | `Sell ->
-    let asks' = match Int.Map.find asks price with
+    let asks' =
+      match Float.Map.find asks price with
     | None -> asks
-    | Some entry -> if entry.seq > seq then asks else Int.Map.remove asks price
+    | Some entry ->
+      if entry.seq > seq then asks else Float.Map.remove asks price
     in
     String.Table.set books symbol { bids; asks=asks' };
     top_changed side asks asks'
@@ -285,17 +290,26 @@ let ws buf ws_init ob_initialized =
       | Error msg -> failwith msg
       | Ok { typ="newTrade"; data } ->
         let trade = M.read_trade data in
+        let price = satoshis_int_of_float_exn trade.price in
+        let qty = satoshis_int_of_float_exn trade.qty in
+        let trade = { DB.ts = trade.ts ; side = trade.side ; price ; qty } in
         debug "%s %d T %s" symbol seq @@ Fn.compose Sexp.to_string DB.sexp_of_trade trade;
       | Ok { typ="orderBookModify"; data } ->
-        let ({ side; price; qty } as update): DB.book_entry = M.read_book data in
-        debug "%s %d M %s" symbol seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
+        let { Plnx.Book.price ; qty ; side } = M.read_book data in
         let _changed = set_entry ~symbol ~side ~seq ~price ~qty in
-        if !ob_initialized then find_negative_cycle ~symbol ~threshold:!threshold
+        if !ob_initialized then find_negative_cycle ~symbol ~threshold:!threshold ;
+        (* let price = satoshis_int_of_float_exn price in *)
+        (* let qty = satoshis_int_of_float_exn qty in *)
+        (* let update = { DB.side = side ; price ; qty } in *)
+        (* debug "%s %d M %s" symbol seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update; *)
       | Ok { typ="orderBookRemove"; data } ->
-        let ({ side; price; qty } as update): DB.book_entry = M.read_book data in
-        debug "%s %d D %s" symbol seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
-        let _changed = del_entry side symbol ~seq ~price in
-        if !ob_initialized then find_negative_cycle ~symbol ~threshold:!threshold
+        let { Plnx.Book.price ; qty ; side } = M.read_book data in
+        let _changed = del_entry ~symbol ~side ~seq ~price in
+        if !ob_initialized then find_negative_cycle ~symbol ~threshold:!threshold ;
+        (* let price = satoshis_int_of_float_exn price in *)
+        (* let qty = satoshis_int_of_float_exn qty in *)
+        (* let update = { DB.side = side ; price ; qty } in *)
+        (* debug "%s %d D %s" symbol seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update; *)
       | Ok { typ } -> failwithf "unexpected message type %s" typ ()
     in
     List.iter args ~f:iter_f;
@@ -314,13 +328,13 @@ let load_books_for_symbol ?depth buf symbol =
   | Error err -> ()
   | Ok { asks; bids; isFrozen; seq } ->
     let bids =
-      List.fold_left bids ~init:Int.Map.empty ~f:begin fun a { side; price; qty } ->
-        Int.Map.add a ~key:price ~data:{ qty; seq }
+      List.fold_left bids ~init:Float.Map.empty ~f:begin fun a { side; price; qty } ->
+        Float.Map.add a ~key:price ~data:{ qty; seq }
       end
     in
     let asks =
-      List.fold_left asks ~init:Int.Map.empty ~f:begin fun a { side; price; qty } ->
-        Int.Map.add a ~key:price ~data:{ qty; seq }
+      List.fold_left asks ~init:Float.Map.empty ~f:begin fun a { side; price; qty } ->
+        Float.Map.add a ~key:price ~data:{ qty; seq }
       end
     in
     String.Table.set books symbol { bids; asks }
@@ -410,7 +424,7 @@ let command =
     +> flag "-logfile" (optional_with_default "log/poloarb.log" string) ~doc:"filename Path of the log file (log/poloarb.log)"
     +> flag "-loglevel" (optional_with_default 1 int) ~doc:"1-3 loglevel"
     +> flag "-fees" (optional_with_default 25 int) ~doc:"bps fees (default: 25)"
-    +> flag "-min-qty" (optional_with_default 50_000_000 int) ~doc:"sats Min qty to arbitrage (default: 0.5 XBT)"
+    +> flag "-min-qty" (optional_with_default 0.5 float) ~doc:"sats Min qty to arbitrage (default: 0.5 XBT)"
   in
   Command.Staged.async ~summary:"Poloniex arbitrageur" spec main
 

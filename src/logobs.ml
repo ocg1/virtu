@@ -126,7 +126,11 @@ module PLNX = struct
       let rec loop () =
         Rest.books sym_polo >>= function
         | Ok { Rest.Books.asks; bids; seq } ->
-          let evts = List.map (bids @ asks) ~f:(fun evt -> DB.BModify evt) in
+          let evts = List.map (bids @ asks) ~f:begin fun { side; price; qty } ->
+              let price = satoshis_int_of_float_exn price in
+              let qty = satoshis_int_of_float_exn qty in
+              DB.BModify { side ; price ; qty }
+            end in
           store db seq evts;
           info "stored %d %s partial" (List.length evts) sym;
           Deferred.unit
@@ -149,14 +153,23 @@ module PLNX = struct
         | Error msg -> failwith msg
         | Ok { typ="newTrade"; data } ->
           let trade = M.read_trade data in
+          let price = satoshis_int_of_float_exn trade.price in
+          let qty = satoshis_int_of_float_exn trade.qty in
+          let trade = { DB.ts = trade.ts ; side = trade.side ; price ; qty } in
           debug "%d T %s" seq @@ Fn.compose Sexp.to_string  DB.sexp_of_trade trade;
           DB.Trade trade
         | Ok { typ="orderBookModify"; data } ->
           let update = M.read_book data in
+          let price = satoshis_int_of_float_exn update.price in
+          let qty = satoshis_int_of_float_exn update.qty in
+          let update = { DB.side = update.side ; price ; qty } in
           debug "%d M %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
           DB.BModify update
         | Ok { typ="orderBookRemove"; data } ->
           let update = M.read_book data in
+          let price = satoshis_int_of_float_exn update.price in
+          let qty = satoshis_int_of_float_exn update.qty in
+          let update = { DB.side = update.side ; price ; qty } in
           debug "%d D %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
           DB.BRemove update
         | Ok { typ } -> failwithf "unexpected message type %s" typ ()
