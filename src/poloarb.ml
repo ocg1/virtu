@@ -50,7 +50,7 @@ type vwap = { bid: float; bid_qty: float; ask: float; ask_qty: float }
 let vwaps : vwap String.Table.t = String.Table.create ()
 
 let key = ref ""
-let secret = ref @@ Cstruct.of_string ""
+let secret = ref ""
 let fees = ref Float.one
 let threshold = ref 0.
 
@@ -385,7 +385,7 @@ let main cfg daemon pidfile logfile loglevel fees' min_qty () =
     end in
     let cfg = List.Assoc.find_exn cfg ~equal:String.(=) "PLNX" in
     key := cfg.key;
-    secret := Cstruct.of_string cfg.secret;
+    secret := cfg.secret;
     info "poloarb starting";
     Plnx_rest.balances ~buf ~key:!key ~secret:!secret () >>= function
     | Error _ -> Deferred.unit
