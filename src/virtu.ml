@@ -7,7 +7,15 @@ open Log.Global
 open Virtu_util
 open Bs_devkit
 
-module Yojson_encoding = Json_encoding.Make(Json_repr.Yojson)
+module Yojson_encoding = struct
+  include Json_encoding.Make(Json_repr.Yojson)
+
+  let safe_destruct encoding v =
+    try destruct encoding v with exn -> begin
+        error "%s" (Format.asprintf "%a" (Json_encoding.print_error ?print_unknown:None) exn) ;
+        raise exn
+      end
+end
 
 let log_ws = Log.(create ~level:`Error ~on_error:`Raise ~output:[Output.stderr ()])
 
@@ -116,7 +124,7 @@ let dead_man's_switch timeout period =
     | Error err ->
       error "%s" @@ Error.to_string_hum err;
       loop ()
-    | Ok _ -> Clock_ns.after @@ Time_ns.Span.of_int_sec period >>= loop
+    | Ok _ -> Clock_ns.after period >>= loop
   in loop ()
 
 let compute_orders ?order symbol side price newQty =
@@ -256,7 +264,7 @@ let update_depth action old_book { Bmex.OrderBook.L2.symbol; id; side ; price = 
 
 let on_orderbook action data =
   (* debug "<- %s" (Yojson.Safe.to_string (`List data)); *)
-  let data = List.map data ~f:(Yojson_encoding.destruct Bmex.OrderBook.L2.encoding) in
+  let data = List.map data ~f:(Yojson_encoding.safe_destruct Bmex.OrderBook.L2.encoding) in
   let data = List.group data ~break:(fun u u' -> u.symbol <> u'.symbol || u.side <> u'.side) in
   let iter_f = function
   | (h :: t) as us when String.Table.mem quoted_instruments h.Bmex.OrderBook.L2.symbol ->
@@ -339,15 +347,14 @@ let import_positions = function
   end
 | #Yojson.Safe.json -> invalid_arg "import_positions"
 
-let market_make strategy instruments =
-  let on_ws_msg msg =
-    let open Bmex_ws in
-    match Yojson_encoding.destruct Response.encoding msg with
+let on_ws_msg msg =
+  let open Bmex_ws in
+  match Yojson_encoding.destruct Response.encoding msg with
   | Welcome _ ->
     info "WS: connected";
     Deferred.unit
   | Error err ->
-    error "BitMEX: error %s" err;
+    error "BitMEX: %s" err;
     Deferred.unit
   | Response { topic; symbol } ->
     info "BitMEX: subscribed to %s" (Topic.show topic) ;
@@ -363,12 +370,13 @@ let market_make strategy instruments =
         end;
       Deferred.unit
     | "execution" -> begin
-      if action = Partial then Ivar.fill_if_empty execs_initialized ()
-      else if action = Insert then on_exec data
+        if action = Partial then Ivar.fill_if_empty execs_initialized ()
+        else if action = Insert then on_exec data
       end;
       Deferred.unit
     | _ -> error "Invalid table %s" table; Deferred.unit
-  in
+
+let market_make strategy instruments =
   (* Cancel all orders *)
   Deferred.Or_error.ok_exn (Order.cancel_all !order_cfg) >>= fun _str ->
   info "all orders canceled";
@@ -376,8 +384,9 @@ let market_make strategy instruments =
   import_positions ps;
   info "positions imported";
   let topics = List.(map instruments ~f:(fun i -> ["execution"; "instrument:" ^ i; "orderBookL2:" ^ i]) |> concat) in
-  don't_wait_for @@ dead_man's_switch 60000 15;
+  don't_wait_for @@ Time_ns.Span.(dead_man's_switch (of_int_sec 60) (of_int_sec 15)) ;
   don't_wait_for @@ begin feed_initialized >>= fun () ->
+    info "feed initialized";
     Deferred.List.iter instruments ~f:begin fun symbol ->
       match String.Table.find positions symbol with
       | None -> Deferred.unit
@@ -394,25 +403,26 @@ let market_make strategy instruments =
     (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
     (fun exn -> error "%s" @@ Exn.to_string exn)
 
-let tickers_of_instrument ?log = function
-| "ETHXBT" ->
-  let open Plnx_ws in
-  let to_ws, to_ws_w = Pipe.create () in
-  let evts = open_connection to_ws in
-  Pipe.filter_map evts ~f:begin function
-  | Wamp.Welcome _ ->
-    don't_wait_for @@ Deferred.ignore @@ M.subscribe to_ws_w ["ticker"];
-    None
-  | Event { args } ->
-    let { Plnx.Ticker.symbol; bid; ask } = M.read_ticker @@ Msgpck.List args in
-    if symbol <> to_remote_sym "ETHXBT" then None
-    else begin
-      Option.iter log ~f:(fun log -> Log.debug log "[T] PLNX %s %f %f" symbol bid ask);
-      Some (satoshis_int_of_float_exn bid, satoshis_int_of_float_exn ask)
+let tickers_of_instrument ?log symbol =
+  match String.subo symbol ~len:3 with
+  | "ETH" ->
+    let open Plnx_ws in
+    let to_ws, to_ws_w = Pipe.create () in
+    let evts = open_connection to_ws in
+    Pipe.filter_map evts ~f:begin function
+    | Wamp.Welcome _ ->
+      don't_wait_for @@ Deferred.ignore @@ M.subscribe to_ws_w ["ticker"];
+      None
+    | Event { args } ->
+      let { Plnx.Ticker.symbol; bid; ask } = M.read_ticker @@ Msgpck.List args in
+      if symbol <> to_remote_sym "ETHXBT" then None
+      else begin
+        Option.iter log ~f:(fun log -> Log.debug log "[T] PLNX %s %f %f" symbol bid ask);
+        Some (satoshis_int_of_float_exn bid, satoshis_int_of_float_exn ask)
+      end
+    | _ -> None
     end
-  | _ -> None
-  end
-| _ -> invalid_arg "tickers_of_instrument"
+  | _ -> invalid_arg "tickers_of_instrument"
 
 let main cfg port daemon pidfile logfile loglevel wsllevel main dry fixed remfixed instruments () =
   if daemon then Daemon.daemonize ~cd:"." ();

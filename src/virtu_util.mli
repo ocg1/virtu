@@ -83,7 +83,7 @@ module Order : sig
     ?filter:Yojson.Safe.json -> cfg -> Yojson.Safe.json Deferred.Or_error.t
 
   val cancel_all_after :
-    cfg -> int -> Yojson.Safe.json Deferred.Or_error.t
+    cfg -> Time_ns.Span.t -> Yojson.Safe.json Deferred.Or_error.t
 end
 
 val mk_amended_limit_order :
