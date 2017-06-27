@@ -43,7 +43,7 @@ module LevelDB_ext = struct
         let nb_trades = List.count evts ~f:(function DB.Trade _ -> true | _ -> false) in
         nb_mods, nb_dels, nb_trades
       in
-      let evts = DB.bin_read_t_list ~pos_ref:(ref 0) buf in
+      let evts = DB.bin_read_entry_list ~pos_ref:(ref 0) buf in
       let evts_len = List.length evts in
       let ups, dels, trades = evts_stats evts in
       let partial = evts_len > 50 && trades = 0 in

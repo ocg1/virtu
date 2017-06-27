@@ -6,7 +6,7 @@ open Bs_devkit
 open Graph
 
 module CycleTbl = Hashtbl.Make (struct
-    type t = (string * float * string) list [@@deriving sexp]
+    type t = (string * float * string) list [@@deriving sexp, hash]
     let compare = [%compare: t]
 
     let hash_fold_t state pairs =
@@ -20,8 +20,6 @@ module CycleTbl = Hashtbl.Make (struct
         state := hash_fold_string !state b
       end;
       !state
-
-    let hash = [%hash: t]
   end)
 
 let string_of_cycle buf cycle =
@@ -263,65 +261,79 @@ let del_entry ~symbol ~side ~seq ~price =
     top_changed side asks asks'
 
 let ws buf ws_init ob_initialized =
-  let open Plnx_ws in
+  let module W = Plnx_ws_new in
   let to_ws, to_ws_w = Pipe.create () in
-  let symbols_of_req_ids = ref [] in
-  let symbols_of_sub_ids = Int.Table.create () in
-  let on_ws_msg = function
-  | Wamp.Welcome _ ->
-    let symbols = String.Table.keys books in
-    Plnx_ws.M.subscribe to_ws_w @@ symbols >>| fun reqids ->
-    symbols_of_req_ids := Option.value_exn ~message:"Ws.subscribe" (List.zip reqids symbols)
-  | Subscribed { reqid; id } ->
-    let sym = List.Assoc.find_exn ~equal:Int.(=) !symbols_of_req_ids reqid in
-    Int.Table.set symbols_of_sub_ids id sym;
-    debug "subscribed %s" sym;
-    if Int.Table.length symbols_of_sub_ids = String.Table.length books then Ivar.fill_if_empty ws_init ();
-    Deferred.unit
-  | Event { pubid; subid; details; args; kwArgs } ->
-    let symbol = Int.Table.find_exn symbols_of_sub_ids subid in
-    let { quote; base } = String.Table.find_exn currs symbol in
-    if not @@ String.Set.mem !arbitrable_symbols base then Deferred.unit else
-    let seq = match List.Assoc.find_exn ~equal:String.(=) kwArgs "seq" with
-    | Msgpck.Int i -> i
-    | _ -> failwith "seq" in
-    let iter_f msg =
-      match of_msgpck msg with
-      | Error msg -> failwith msg
-      | Ok { typ="newTrade"; data } ->
-        let trade = M.read_trade data in
-        let price = satoshis_int_of_float_exn trade.price in
-        let qty = satoshis_int_of_float_exn trade.qty in
-        let trade = { DB.ts = trade.ts ; side = trade.side ; price ; qty } in
-        debug "%s %d T %s" symbol seq @@ Fn.compose Sexp.to_string DB.sexp_of_trade trade;
-      | Ok { typ="orderBookModify"; data } ->
-        let { Plnx.Book.price ; qty ; side } = M.read_book data in
-        let _changed = set_entry ~symbol ~side ~seq ~price ~qty in
-        if !ob_initialized then find_negative_cycle ~symbol ~threshold:!threshold ;
-        (* let price = satoshis_int_of_float_exn price in *)
-        (* let qty = satoshis_int_of_float_exn qty in *)
-        (* let update = { DB.side = side ; price ; qty } in *)
-        (* debug "%s %d M %s" symbol seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update; *)
-      | Ok { typ="orderBookRemove"; data } ->
-        let { Plnx.Book.price ; qty ; side } = M.read_book data in
-        let _changed = del_entry ~symbol ~side ~seq ~price in
-        if !ob_initialized then find_negative_cycle ~symbol ~threshold:!threshold ;
-        (* let price = satoshis_int_of_float_exn price in *)
-        (* let qty = satoshis_int_of_float_exn qty in *)
-        (* let update = { DB.side = side ; price ; qty } in *)
-        (* debug "%s %d D %s" symbol seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update; *)
-      | Ok { typ } -> failwithf "unexpected message type %s" typ ()
-    in
-    List.iter args ~f:iter_f;
-    Deferred.unit
-  | msg ->
-    (* error "unknown message: %s" (Wamp.sexp_of_msg Msgpck.sexp_of_t msg |> Sexplib.Sexp.to_string); *)
-    Deferred.unit
+  let subid_to_sym = Int.Table.create () in
+  let initialized = ref false in
+  let latest_ts = ref Time_ns.epoch in
+  let timeout = Time_ns.Span.of_int_sec 30 in
+  let on_trade ~id ~symbol ~ts ~price ~qty ~side =
+    let price = satoshis_int_of_float_exn price in
+    let qty = satoshis_int_of_float_exn qty in
+    let trade = { DB.ts = ts ; side = side ; price ; qty } in
+    debug "%s %d T %s" symbol id @@ Fn.compose Sexp.to_string DB.sexp_of_trade trade
   in
-  let ws = Plnx_ws.open_connection to_ws in
-  Monitor.handle_errors
-    (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
-    (fun exn -> error "%s" @@ Exn.to_string exn)
+  let on_update ~id ~symbol ~side ~price ~qty =
+    if qty = 0. then begin
+      let _changed = del_entry ~symbol ~side ~seq:id ~price in
+      if !ob_initialized then find_negative_cycle ~symbol ~threshold:!threshold
+    end else begin
+      let _changed = set_entry ~symbol ~side ~seq:id ~price ~qty in
+      if !ob_initialized then find_negative_cycle ~symbol ~threshold:!threshold ;
+    end
+  in
+  let on_event subid id = function
+  | W.Repr.Snapshot { symbol ; bid ; ask } ->
+    let { base } = String.Table.find_exn currs symbol in
+    if String.Set.mem !arbitrable_symbols base then begin
+      Int.Table.set subid_to_sym subid symbol ;
+      if Int.Table.length subid_to_sym = String.Table.length books then
+        Ivar.fill_if_empty ws_init () ;
+      Float.Map.iteri bid ~f:(fun ~key ~data -> on_update ~id ~symbol ~side:`Buy ~price:key ~qty:data) ;
+      Float.Map.iteri ask ~f:(fun ~key ~data -> on_update ~id ~symbol ~side:`Sell ~price:key ~qty:data)
+    end
+  | Update { side; price; qty } ->
+    let symbol = Int.Table.find_exn subid_to_sym subid in
+    let { base } = String.Table.find_exn currs symbol in
+    if String.Set.mem !arbitrable_symbols base then
+      on_update ~id ~symbol ~side ~price ~qty
+  | Trade { gid; id; ts; side; price; qty } ->
+    let symbol = Int.Table.find_exn subid_to_sym subid in
+    let { base } = String.Table.find_exn currs symbol in
+    if String.Set.mem !arbitrable_symbols base then
+      on_trade ~id ~symbol ~ts ~price ~qty ~side
+  in
+  let on_ws_msg = function
+  | W.Repr.Error msg ->
+    error "%s" msg
+  | Event { subid ; id ; events } ->
+    if not !initialized then begin
+      let symbols = String.Table.keys books in
+      List.iter symbols ~f:begin fun symbol ->
+        Pipe.write_without_pushback to_ws_w (W.Repr.Subscribe symbol)
+      end ;
+      initialized := true
+    end ;
+    List.iter events ~f:(on_event subid id)
+  in
+  let connected = Condition.create () in
+  let restart, ws = W.open_connection ~connected to_ws in
+  let rec handle_init () =
+    Condition.wait connected >>= fun () ->
+    initialized := false ;
+    handle_init () in
+  don't_wait_for (handle_init ()) ;
+  let watchdog () =
+    let now = Time_ns.now () in
+    let diff = Time_ns.diff now !latest_ts in
+    if Time_ns.(!latest_ts <> epoch) && Time_ns.Span.(diff > timeout) then
+      Condition.signal restart () in
+  Clock_ns.every timeout watchdog ;
+  Monitor.handle_errors begin fun () ->
+    Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg
+  end begin fun exn ->
+    error "%s" @@ Exn.to_string exn
+  end
 
 let load_books_for_symbol ?depth buf symbol =
   Plnx_rest.books ~buf ?depth symbol >>| function

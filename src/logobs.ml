@@ -20,7 +20,7 @@ let make_store () =
     let scratch_shared = Bigstring.sub_shared scratch ~len:nb_written in
     Bigbuffer.add_bigstring buf scratch_shared;
     List.iter evts ~f:begin fun e ->
-      let nb_written = Bs_devkit.DB.bin_write_t scratch ~pos:0 e in
+      let nb_written = Bs_devkit.DB.bin_write_entry scratch ~pos:0 e in
       let scratch_shared = Bigstring.sub_shared scratch ~len:nb_written in
       Bigbuffer.add_bigstring buf scratch_shared;
     end;
@@ -66,7 +66,7 @@ module BMEX = struct
               update_of_l2 u |>
               Option.map ~f:(fun u -> evt_of_update_action u action)
             end in
-          debug "%s" (DB.sexp_of_t_list data |> Sexp.to_string);
+          debug "%s" (DB.sexp_of_entry_list data |> Sexp.to_string);
           store db now data
         in
         List.iter groups ~f:iter_f
@@ -75,7 +75,7 @@ module BMEX = struct
         let iter_f t =
           let db = String.Table.find_exn bmex_dbs t.Trade.symbol in
           let data = List.filter_map data ~f:trade_of_bmex in
-          debug "%s" (DB.sexp_of_t_list data |> Sexp.to_string);
+          debug "%s" (DB.sexp_of_entry_list data |> Sexp.to_string);
           store db now data
         in
         List.iter data ~f:iter_f
@@ -101,89 +101,77 @@ end
 
 module PLNX = struct
   module Rest = Plnx_rest
-  open Plnx_ws
-
-  let polo_of_symbol = function
-  | "ETHXBT" -> "BTC_ETH"
-  | "MAIDXBT" -> "BTC_MAID"
-  | _ -> invalid_arg "polo_of_symbol"
+  module W = Plnx_ws_new
 
   let record symbols =
-    let syms_polo = List.map symbols ~f:polo_of_symbol in
+    let timeout = Time_ns.Span.of_int_sec 30 in
+    let latest_ts = ref Time_ns.epoch in
+    let initialized = ref false in
     let store = make_store () in
     let to_ws, to_ws_w = Pipe.create () in
-    let symbols_of_req_ids = ref [] in
-    let symbols_of_sub_ids = Int.Table.create () in
-    let on_ws_msg = function
-    | Wamp.Welcome _ ->
-      M.subscribe to_ws_w syms_polo >>| fun reqids ->
-      symbols_of_req_ids := Option.value_exn ~message:"Ws.subscribe" (List.zip reqids symbols)
-    | Subscribed { reqid; id } ->
-      let sym = List.Assoc.find_exn ~equal:Int.(=) !symbols_of_req_ids reqid in
-      let sym_polo = polo_of_symbol sym in
-      Int.Table.set symbols_of_sub_ids id sym;
-      let db = String.Table.find_exn plnx_dbs sym in
-      let rec loop () =
-        Rest.books sym_polo >>= function
-        | Ok { Rest.Books.asks; bids; seq } ->
-          let evts = List.map (bids @ asks) ~f:begin fun { side; price; qty } ->
-              let price = satoshis_int_of_float_exn price in
-              let qty = satoshis_int_of_float_exn qty in
-              DB.BModify { side ; price ; qty }
-            end in
-          store db seq evts;
-          info "stored %d %s partial" (List.length evts) sym;
-          Deferred.unit
-        | Error err ->
-          error "%s" (Plnx_rest.Http_error.to_string err);
-          Clock_ns.after @@ Time_ns.Span.of_int_sec 10 >>=
-          loop
-      in
-      don't_wait_for @@ loop ();
-      debug "subscribed %s" sym;
-      Deferred.unit
-    | Event { pubid; subid; details; args; kwArgs } ->
-      let sym = Int.Table.find_exn symbols_of_sub_ids subid in
-      let db = String.Table.find_exn plnx_dbs sym in
-      let seq = match List.Assoc.find_exn ~equal:String.(=) kwArgs "seq" with
-      | Msgpck.Int i -> i
-      | _ -> failwith "seq" in
-      let map_f msg =
-        match of_msgpck msg with
-        | Error msg -> failwith msg
-        | Ok { typ="newTrade"; data } ->
-          let trade = M.read_trade data in
-          let price = satoshis_int_of_float_exn trade.price in
-          let qty = satoshis_int_of_float_exn trade.qty in
-          let trade = { DB.ts = trade.ts ; side = trade.side ; price ; qty } in
-          debug "%d T %s" seq @@ Fn.compose Sexp.to_string  DB.sexp_of_trade trade;
-          DB.Trade trade
-        | Ok { typ="orderBookModify"; data } ->
-          let update = M.read_book data in
-          let price = satoshis_int_of_float_exn update.price in
-          let qty = satoshis_int_of_float_exn update.qty in
-          let update = { DB.side = update.side ; price ; qty } in
-          debug "%d M %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
-          DB.BModify update
-        | Ok { typ="orderBookRemove"; data } ->
-          let update = M.read_book data in
-          let price = satoshis_int_of_float_exn update.price in
-          let qty = satoshis_int_of_float_exn update.qty in
-          let update = { DB.side = update.side ; price ; qty } in
-          debug "%d D %s" seq @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update;
-          DB.BRemove update
-        | Ok { typ } -> failwithf "unexpected message type %s" typ ()
-      in
-      store db seq @@ List.map args ~f:map_f;
-      Deferred.unit
-    | msg ->
-      (* error "unknown message: %s" (Wamp.sexp_of_msg Msgpck.sexp_of_t msg |> Sexplib.Sexp.to_string); *)
-      Deferred.unit
+    let subid_to_sym = Int.Table.create () in
+    let on_event subid id = function
+    | W.Repr.Snapshot { symbol ; bid ; ask } ->
+      Int.Table.set subid_to_sym subid symbol ;
+      let evts = Float.Map.fold bid ~init:[] ~f:begin fun ~key:price ~data:qty a ->
+          let price = satoshis_int_of_float_exn price in
+          let qty = satoshis_int_of_float_exn qty in
+          DB.BModify { side = `Buy ; price ; qty } :: a
+        end in
+      debug "stored %d %s partial" (List.length evts) symbol ;
+      symbol, evts
+    | Update entry ->
+      let symbol = Int.Table.find_exn subid_to_sym subid in
+      let price = satoshis_int_of_float_exn entry.price in
+      let qty = satoshis_int_of_float_exn entry.qty in
+      let update = { DB.side = entry.side ; price ; qty } in
+      debug "%d M %s" id @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update ;
+      symbol, [if qty = 0 then DB.BRemove update else DB.BModify update]
+    | Trade t ->
+      let symbol = Int.Table.find_exn subid_to_sym subid in
+      let price = satoshis_int_of_float_exn t.price in
+      let qty = satoshis_int_of_float_exn t.qty in
+      let trade = { DB.ts = t.ts ; side = t.side ; price ; qty } in
+      debug "%d T %s" id @@ Fn.compose Sexp.to_string  DB.sexp_of_trade trade ;
+      symbol, [DB.Trade trade]
     in
-    let ws = open_connection to_ws in
-    Monitor.handle_errors
-      (fun () -> Pipe.iter ~continue_on_error:true ws ~f:on_ws_msg)
-      (fun exn -> error "%s" @@ Exn.to_string exn)
+    let on_ws_msg = function
+    | W.Repr.Error msg ->
+      error "%s" msg
+    | Event { subid ; id ; events } ->
+      if not !initialized then begin
+        List.iter symbols ~f:begin fun symbol ->
+          Pipe.write_without_pushback to_ws_w (W.Repr.Subscribe symbol)
+        end ;
+        initialized := true
+      end ;
+      let symbol, evts = List.fold_left events ~init:("", []) ~f:begin fun (s, a) e ->
+          let s, e = on_event subid id e in
+          s, a @ e
+        end in
+      if evts <> [] then begin
+        let db = String.Table.find_exn plnx_dbs symbol in
+        store db id evts
+      end
+    in
+    let connected = Condition.create () in
+    let restart, ws = W.open_connection ~connected to_ws in
+    let rec handle_init () =
+      Condition.wait connected >>= fun () ->
+      initialized := false ;
+      handle_init () in
+    don't_wait_for (handle_init ()) ;
+    let watchdog () =
+      let now = Time_ns.now () in
+      let diff = Time_ns.diff now !latest_ts in
+      if Time_ns.(!latest_ts <> epoch) && Time_ns.Span.(diff > timeout) then
+        Condition.signal restart () in
+    Clock_ns.every timeout watchdog ;
+    Monitor.handle_errors begin fun () ->
+      Pipe.iter_without_pushback ~continue_on_error:true ws ~f:on_ws_msg
+    end begin fun exn ->
+      error "%s" @@ Exn.to_string exn
+    end
 end
 
 let (//) = Filename.concat
@@ -264,11 +252,11 @@ let show datadir rev_iter max_ticks symbol () =
     Bigbuffer.clear buf;
     Bigbuffer.add_string buf data;
     let seq = Binary_packing.unpack_signed_64_int_big_endian ~buf:seq ~pos:0 in
-    let update = DB.bin_read_t_list ~pos_ref:(ref 0) @@ Bigbuffer.big_contents buf in
+    let update = DB.bin_read_entry_list ~pos_ref:(ref 0) @@ Bigbuffer.big_contents buf in
     begin if List.length update > 100 then
         Format.printf "%d (Partial)@." seq
       else
-      Format.printf "%d %a@." seq Sexp.pp @@ DB.sexp_of_t_list update
+      Format.printf "%d %a@." seq Sexp.pp @@ DB.sexp_of_entry_list update
     end;
     incr nb_read;
     Option.value_map max_ticks
@@ -286,17 +274,54 @@ let show =
   let spec =
     let open Command.Spec in
     empty
-    +> flag "-datadir" (optional_with_default "data/bitmex" string) ~doc:"path Where to store DBs (data/bitmex)"
+    +> flag "-datadir" (optional_with_default "data/bitmex" string) ~doc:"path Where DBs are stored (data/bitmex)"
     +> flag "-rev-iter" no_arg ~doc:" Show latest records"
     +> flag "-n" (optional int) ~doc:"n Number of ticks to display (default: all)"
     +> anon ("symbol" %: string)
   in
   Command.basic ~summary:"Show LevelDB order book databases" spec show
 
+let pack datadir fn symbol () =
+  let iter_f oc _seq data =
+    Out_channel.output_string oc data ;
+    true
+  in
+  let dbpath = Filename.concat datadir symbol in
+  Core.(match Sys.is_directory dbpath with
+    | `No | `Unknown -> invalid_argf "No DB for %s" symbol ()
+    | `Yes -> ());
+  let db = LevelDB.open_db dbpath in
+  Out_channel.with_file fn ~f:begin fun oc ->
+    Exn.protectx db ~finally:LevelDB.close ~f:(LevelDB.iter (iter_f oc)) ;
+  end ;
+  let content = In_channel.read_all fn in
+  let content = Bigstring.of_string content in
+  let pos_ref = ref 0 in
+  let read () =
+    let update = DB.bin_read_entry_list ~pos_ref content in
+    begin if List.length update > 100 then
+        Format.printf "(Partial)@."
+      else
+      Format.printf "%a@." Sexp.pp @@ DB.sexp_of_entry_list update
+    end
+  in
+  try while true do read () done with _ -> ()
+
+let pack =
+  let spec =
+    let open Command.Spec in
+    empty
+    +> flag "-datadir" (optional_with_default "data/bitmex" string) ~doc:"path Where DBs are stored (data/bitmex)"
+    +> flag "-o" (optional_with_default "data.pack" string) ~doc:"Path to store DB"
+    +> anon ("symbol" %: string)
+  in
+  Command.basic ~summary:"Show LevelDB order book databases" spec pack
+
 let command =
   Command.group ~summary:"Manage order books logging" [
     "record", record;
     "show", show;
+    "pack", pack;
   ]
 
 let () = Command.run command
