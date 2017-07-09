@@ -34,16 +34,16 @@ module BMEX = struct
     let price = Option.value_map price ~default:0 ~f:satoshis_int_of_float_exn in
     let qty = Option.value ~default:0 size in
     match side with
-    | Some `Buy ->  Some DB.{ side = `Buy ; price ; qty }
-    | Some `Sell -> Some DB.{ side = `Sell ; price ; qty }
-    | None -> None
+    | `buy ->  Some DB.{ side = `Buy ; price ; qty }
+    | `sell -> Some DB.{ side = `Sell ; price ; qty }
+    | `buy_sell_unset -> None
 
   let trade_of_bmex { Trade.symbol ; timestamp = ts ; side ; price ; size } =
     let price = satoshis_int_of_float_exn price in
     match side with
-    | Some `Buy -> Some DB.(Trade { ts ; side = `Buy ; price ; qty = size })
-    | Some `Sell -> Some DB.(Trade { ts ; side = `Sell ; price ; qty = size })
-    | None -> None
+    | `buy -> Some DB.(Trade { ts ; side = `Buy ; price ; qty = size })
+    | `sell -> Some DB.(Trade { ts ; side = `Sell ; price ; qty = size })
+    | `buy_sell_unset -> None
 
   let evt_of_update_action up = function
   | Response.Update.Partial | Insert | Update -> DB.BModify up

@@ -9,8 +9,8 @@ module Order = struct
 
   type cfg = {
     dry_run: bool ;
-    current_bids: RespObj.t String.Table.t ;
-    current_asks: RespObj.t String.Table.t ;
+    current_bids: R.Order.t String.Table.t ;
+    current_asks: R.Order.t String.Table.t ;
     testnet: bool ;
     key: string ;
     secret: Cstruct.t ;
@@ -33,73 +33,86 @@ module Order = struct
   | _ -> invalid_arg "oid_of_respobj"
 
   let position cfg =
-    R.position ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret ()
+    R.Position.get ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret ()
 
   let submit ?buf cfg orders =
     if orders = [] then Deferred.Or_error.error_string "submit: empty orders"
-    else if cfg.dry_run then Deferred.Or_error.return (`List orders)
+    else if cfg.dry_run then
+      Deferred.Or_error.return (Cohttp.Response.make (), `Assoc [])
     else
-    R.submit_order ?buf ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders >>| function
+    R.Order.submit_bulk
+      ?buf
+      ?log:cfg.log
+      ~testnet:cfg.testnet
+      ~key:cfg.key
+      ~secret:cfg.secret orders >>| function
     | Ok res ->
       List.iter orders ~f:begin fun o ->
-        let o = RespObj.of_json o in
-        let sym = RespObj.string_exn o "symbol" in
-        let side = RespObj.string_exn o "side" |> Side.of_string in
-        match side with
-        | None -> ()
-        | Some `Buy -> String.Table.set cfg.current_bids sym o
-        | Some `Sell -> String.Table.set cfg.current_asks sym o
+        match Int.sign o.orderQty with
+        | Zero -> ()
+        | Pos -> String.Table.set cfg.current_bids o.symbol o
+        | Neg -> String.Table.set cfg.current_asks o.symbol o
       end ;
       Ok res
     | Error err ->
       List.iter orders ~f:begin fun o ->
-        let o = RespObj.of_json o in
-        let sym = RespObj.string_exn o "symbol" in
-        let side = RespObj.string_exn o "side" |> Side.of_string in
-        match side with
-        | None -> ()
-        | Some `Buy -> String.Table.remove cfg.current_bids sym
-        | Some `Sell -> String.Table.remove cfg.current_asks sym
+        match Int.sign o.orderQty with
+        | Zero -> ()
+        | Pos -> String.Table.remove cfg.current_bids o.symbol
+        | Neg -> String.Table.remove cfg.current_asks o.symbol
       end ;
       Error err
 
-  let update cfg orders =
-    let update_table table sym o =
-      String.Table.update table sym ~f:begin function
-      | Some old_o -> RespObj.merge old_o o
-      | None -> o
-      end in
-    if orders = [] then Deferred.Or_error.error_string "update: empty orders"
-    else if cfg.dry_run then
-      Deferred.Or_error.return (`List orders)
-    else
-    R.update_order ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret orders  >>| function
-    | Error err -> Error err
-    | Ok res -> List.iter orders ~f:begin fun o ->
-        let o = RespObj.of_json o in
-        let sym = RespObj.string_exn o "symbol" in
-        let side = RespObj.string_exn o "side" |> Side.of_string in
-        match side with
-        | None -> ()
-        | Some `Buy -> update_table cfg.current_bids sym o
-        | Some `Sell -> update_table cfg.current_asks sym o
-      end ;
-      Ok res
+  let update_table table sym o =
+    String.Table.update table sym ~f:begin function
+    | Some old_o ->
+      (* RespObj.merge old_o o *)
+      old_o (* FIXME!!! *)
+    | None -> o
+    end
+
+  (* let update cfg orders = *)
+  (*   if orders = [] then Deferred.Or_error.error_string "update: empty orders" *)
+  (*   else if cfg.dry_run then *)
+  (*     Deferred.Or_error.return (Cohttp.Response.make (), `Assoc []) *)
+  (*   else *)
+  (*   R.Order.amend_bulk *)
+  (*     ?log:cfg.log *)
+  (*     ~testnet:cfg.testnet *)
+  (*     ~key:cfg.key *)
+  (*     ~secret:cfg.secret orders  >>| function *)
+  (*   | Error err -> Error err *)
+  (*   | Ok res -> List.iter orders ~f:begin fun o -> *)
+  (*       match Option.value_map ~default:Sign.Zero ~f:Int.sign o.leavesQty with *)
+  (*       | Zero -> () *)
+  (*       | Pos -> update_table cfg.current_bids o.symbol o *)
+  (*       | Neg -> update_table cfg.current_asks o.symbol o *)
+  (*     end ; *)
+  (*     Ok res *)
 
   let cancel_all ?symbol ?filter cfg =
     if cfg.dry_run then begin
       String.Table.clear cfg.current_bids;
       String.Table.clear cfg.current_asks;
-      Deferred.Or_error.return `Null
+      Deferred.Or_error.return (Cohttp.Response.make ())
     end
     else
-    R.cancel_all_orders ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret ?symbol ?filter ()
+    R.Order.cancel_all
+      ?log:cfg.log
+      ~testnet:cfg.testnet
+      ~key:cfg.key
+      ~secret:cfg.secret ?symbol ?filter ()
 
   let cancel_all_after cfg timeout =
     if cfg.dry_run then
-      Deferred.Or_error.return `Null
+      Deferred.Or_error.return (Cohttp.Response.make ())
     else
-    R.cancel_all_orders_after ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret timeout
+    R.Order.cancel_all_after
+      ?log:cfg.log
+      ~testnet:cfg.testnet
+      ~key:cfg.key
+      ~secret:cfg.secret
+      timeout
 end
 
 type best_price_kind = Best | Vwap
@@ -162,31 +175,22 @@ let exponent_divisor_of_tickSize tickSize =
 let float_of_satoshis symbol { multiplier; mult_exponent; divisor } price =
   Printf.sprintf "%.*f" (Int.neg mult_exponent) (Float.of_int (price / divisor) *. multiplier) |> Float.of_string
 
-let mk_new_market_order ~symbol ~qty : Yojson.Safe.json =
-  `Assoc [
-    "symbol", `String symbol;
-    "orderQty", `Int qty;
-    "ordType", `String "Market";
-  ]
+let mk_new_market_order ~symbol ~orderQty =
+  Bmex_rest.Order.create ~symbol ~orderQty ~ordType:`order_type_market ()
 
-let mk_new_limit_order ~symbol ~ticksize ~side ~price ~qty uuid_str =
-  `Assoc [
-    "clOrdID", `String uuid_str;
-    "symbol", `String symbol;
-    "side", `String (Bmex.Side.to_string side);
-    "price", `Float (float_of_satoshis symbol ticksize price);
-    "orderQty", `Int qty;
-    "execInst", `String "ParticipateDoNotInitiate"
-  ]
+let mk_new_limit_order ~clOrdID ~symbol ~orderQty ~ticksize ~price =
+  Bmex_rest.Order.create ~symbol ~clOrdID ~orderQty
+    ~price:(float_of_satoshis symbol ticksize price)
+    ~execInst:[ParticipateDoNotInitiate] ()
 
-let mk_amended_limit_order ?price ?qty ~symbol ~side ~ticksize orig oid =
-  `Assoc (List.filter_opt [
-      Some ("symbol", `String symbol);
-      Some ("side", `String (Bmex.Side.to_string side));
-      Some ((match orig with `S -> "orderID" | `C -> "clOrdID"), `String oid);
-      Option.map qty ~f:(fun qty -> "leavesQty", `Int qty);
-      Option.map price ~f:(fun price -> "price", `Float (float_of_satoshis symbol ticksize price));
-    ])
+let mk_amended_limit_order ?price ?leavesQty ~symbol ~ticksize orig oid =
+  let orderID, clOrdID =
+    match orig with
+    | `S -> Some oid, None
+    | `C -> None, Some oid in
+  let price = Option.map price
+      ~f:(fun price -> (float_of_satoshis symbol ticksize price)) in
+  Bmex_rest.Order.create_amend ?orderID ?clOrdID ?leavesQty ?price ()
 
 let to_remote_sym = function
   | "XBTUSD" -> "BTCUSD"

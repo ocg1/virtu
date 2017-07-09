@@ -80,7 +80,7 @@ let on_trade datafile action data =
     let cur_pos = String.Table.find_exn positions t.symbol in
     let { bid; ask } = String.Table.find_exn quotes t.symbol in
     match t.side, bid, ask with
-    | Some `Buy, _, Some (best_p, best_q) ->
+    | `buy, _, Some (best_p, best_q) ->
       let qty = Int.min best_q @@ cur_pos + max_pos_size in
       let price = best_p - tickSize in
       let resulting_pos = cur_pos - qty in
@@ -92,7 +92,7 @@ let on_trade datafile action data =
       sexp_of_trade |>
       Sexp.output_mach oc;
       String.Table.set positions t.symbol resulting_pos
-    | Some `Sell, Some (best_p, best_q), _ ->
+    | `sell, Some (best_p, best_q), _ ->
       let qty = Int.min best_q @@ max_pos_size - cur_pos in
       let price = best_p + tickSize in
       let resulting_pos = cur_pos + qty in

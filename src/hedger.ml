@@ -79,7 +79,7 @@ let compute_vwaps sym side vwaps old_book new_book =
   | Some old_best, Some new_best, Some (old_vwap, _) when old_best <> new_best || old_vwap <> new_vwap ->
     if old_best <> new_best then
       Log.debug log_bfx "-> tickup %s %s %d %d"
-        sym (Bmex.Side.to_string (side :> Bmex.Side.t))
+        sym (match side with `Buy -> "Buy" | `Sell -> "Sell")
         (new_best / 1_000_000) (new_vwap / 1_000_000);
     Option.iter !tickups_w ~f:begin fun p -> try
       let open Protocols.OrderBook in

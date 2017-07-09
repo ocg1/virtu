@@ -4,7 +4,11 @@ open Log.Global
 
 open Bs_devkit
 
-type trade = { price: int; qty: int; side: [`Buy | `Sell] } [@@deriving sexp]
+type trade = {
+  price: int;
+  qty: int;
+  side: [ `buy | `sell | `buy_sell_unset ]
+} [@@deriving sexp]
 
 type evt =
   | Trade of trade
@@ -31,7 +35,6 @@ module LDB = struct
       let { Tick.p; v; side } = Tick.Bytes.read' ~ts ~data () in
       let price = Int63.to_int_exn p in
       let qty = Int63.to_int_exn v in
-      let side = Option.value_exn side in
       incr count;
       Iterator.next i;
       Pipe.write w @@ { ts ; data = (Trade { price; qty; side }) } >>= fun () ->
@@ -119,7 +122,7 @@ let main gnuplot max_count low high (db_ob, db_trades, ticksize, size) () =
     if !count = 0 then ts_int_at_start := Time_ns.to_int_ns_since_epoch ts;
     let old_position = !position in
     let old_balance = !balance in
-    let qty = match side with `Buy -> Int.neg qty | `Sell -> qty in
+    let qty = match side with `buy -> Int.neg qty | _ -> qty in
     let max_buy = size - old_position in
     let max_sell = - size - old_position in
     let trade_qty = match Int.sign qty with

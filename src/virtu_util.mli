@@ -48,8 +48,8 @@ val best_of_side :
 module Order : sig
   type cfg = {
     dry_run: bool ;
-    current_bids: RespObj.t String.Table.t ;
-    current_asks: RespObj.t String.Table.t ;
+    current_bids: Bmex_rest.Order.t String.Table.t ;
+    current_asks: Bmex_rest.Order.t String.Table.t ;
     testnet: bool ;
     key: string ;
     secret: Cstruct.t ;
@@ -58,8 +58,8 @@ module Order : sig
 
   val create_cfg :
     ?dry_run:bool ->
-    ?current_bids:RespObj.t String.Table.t ->
-    ?current_asks:RespObj.t String.Table.t ->
+    ?current_bids:Bmex_rest.Order.t String.Table.t ->
+    ?current_asks:Bmex_rest.Order.t String.Table.t ->
     ?testnet:bool ->
     ?key:string -> ?secret:Cstruct.t -> ?log:Log.t -> unit -> cfg
 
@@ -67,46 +67,49 @@ module Order : sig
     Yojson.Safe.json String.Map.t -> [`C | `S] * string
 
   val position :
-    cfg -> Yojson.Safe.json Deferred.Or_error.t
+    cfg -> (Cohttp.Response.t * Yojson.Safe.json) Deferred.Or_error.t
 
   val submit :
     ?buf:Bi_outbuf.t ->
     cfg ->
-    Yojson.Safe.json list -> Yojson.Safe.json Deferred.Or_error.t
+    Bmex_rest.Order.t list ->
+    (Cohttp.Response.t * Yojson.Safe.json) Deferred.Or_error.t
 
-  val update :
-    cfg -> Yojson.Safe.json list ->
-    Yojson.Safe.json Deferred.Or_error.t
+  (* val update : *)
+  (*   cfg -> Yojson.Safe.json list -> *)
+  (*   Yojson.Safe.json Deferred.Or_error.t *)
 
   val cancel_all :
     ?symbol:string ->
-    ?filter:Yojson.Safe.json -> cfg -> Yojson.Safe.json Deferred.Or_error.t
+    ?filter:Yojson.Safe.json -> cfg ->
+    Cohttp.Response.t Deferred.Or_error.t
 
   val cancel_all_after :
-    cfg -> Time_ns.Span.t -> Yojson.Safe.json Deferred.Or_error.t
+    cfg -> Time_ns.Span.t ->
+    Cohttp.Response.t Deferred.Or_error.t
 end
 
 val mk_amended_limit_order :
   ?price:int ->
-  ?qty:int ->
+  ?leavesQty:int ->
   symbol:string ->
-  side:[`Buy | `Sell] ->
   ticksize:ticksize ->
   [< `C | `S ] ->
   string ->
-  Yojson.Safe.json
+  Bmex_rest.Order.amend
 
 val mk_new_market_order :
-  symbol:string -> qty:int -> Yojson.Safe.json
+  symbol:string ->
+  orderQty:int ->
+  Bmex_rest.Order.t
 
 val mk_new_limit_order :
+  clOrdID:string ->
   symbol:string ->
+  orderQty:int ->
   ticksize:ticksize ->
-  side:[`Buy | `Sell] ->
   price:int ->
-  qty:int ->
-  string ->
-  Yojson.Safe.json
-
+  ordType:Bmex.OrderType.t ->
+  Bmex_rest.Order.t
 
 
