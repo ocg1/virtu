@@ -20,7 +20,7 @@ end
 let log_ws = Log.(create ~level:`Error ~on_error:`Raise ~output:[Output.stderr ()])
 
 let api_key = ref ""
-let api_secret = ref @@ Cstruct.of_string ""
+let api_secret = ref ""
 let testnet = ref true
 
 let order_cfg = ref @@ Order.create_cfg ()
@@ -127,20 +127,19 @@ let dead_man's_switch timeout period =
     | Ok _ -> Clock_ns.after period >>= loop
   in loop ()
 
-let compute_orders ?order symbol side price newQty =
+let compute_orders ?order symbol price newQty =
   let leavesQty = Option.map order ~f:(fun o -> RespObj.int64_exn o "leavesQty" |> Int64.to_int_exn) in
   let ticksize = String.Table.find_exn ticksizes symbol in
   let leavesQtySexp = Option.sexp_of_t Int.sexp_of_t leavesQty |> Sexp.to_string_hum in
-  debug "compute_orders %s %s %d %s %d" symbol
-    (Bmex.Side.to_string side)
+  debug "compute_orders %s %d %s %d" symbol
     (price / ticksize.divisor) leavesQtySexp newQty;
   match leavesQty with
   | None when newQty > 0 ->
     let clOrdID = Uuid.(create () |> to_string) in
-    Some (clOrdID, mk_new_limit_order ~symbol ~side ~ticksize ~price ~qty:newQty clOrdID), None
+    Some (clOrdID, mk_new_limit_order ~symbol ~ticksize ~price ~orderQty:newQty ~clOrdID), None
   | Some leavesQty when leavesQty > 0 || leavesQty = 0 && newQty > 0 ->
-    let orig, oid = Order.oid_of_respobj (Option.value_exn order) in
-    None, Some (oid, mk_amended_limit_order ~symbol ~side ~ticksize ~price ~qty:newQty orig oid)
+    let oid = Order.oid_of_respobj (Option.value_exn order) in
+    None, Some (oid, mk_amended_limit_order ~symbol ~ticksize ~price ~leavesQty:newQty oid)
   | _ -> None, None
 
 let string_of_order = function
@@ -181,16 +180,16 @@ let on_position_update symbol oldQty diff =
   | None, Some (price, _qty) -> price
   | _ -> failwith "No suitable ask price found"
   in
-  let bidSubmit, bidAmend = compute_orders ?order:currentBid symbol `Buy bidPrice newBidQty in
-  let askSubmit, askAmend = compute_orders ?order:currentAsk symbol `Sell askPrice newAskQty in
+  let bidSubmit, bidAmend = compute_orders ?order:currentBid symbol bidPrice newBidQty in
+  let askSubmit, askAmend = compute_orders ?order:currentAsk symbol askPrice (- newAskQty) in
   let make_th f orders = match
     List.fold_left orders ~init:[]
       ~f:(fun a -> function None -> a | Some (_, o) -> o :: a)
   with
   | [] -> Deferred.unit
-  | orders -> f !order_cfg orders >>| function
+  | orders -> f ?buf:None !order_cfg orders >>| function
     | Ok _ -> ()
-    | Error err -> error "on_position_update: %s: %s" (Yojson.Safe.to_string (`List orders)) (Error.to_string_hum err)
+    | Error err -> error "on_position_update: %s" (Error.to_string_hum err)
   in
   let submit_th = make_th Order.submit [bidSubmit; askSubmit] in
   let amend_th = make_th Order.update [bidAmend; askAmend] in
@@ -268,10 +267,10 @@ let on_orderbook action data =
   let data = List.group data ~break:(fun u u' -> u.symbol <> u'.symbol || u.side <> u'.side) in
   let iter_f = function
   | (h :: t) as us when String.Table.mem quoted_instruments h.Bmex.OrderBook.L2.symbol ->
-    let side, best_elt_f, books, vwaps = match h.side with
-    | Some `Buy -> `Buy, Int.Map.max_elt, OrderBook.bids, OrderBook.bid_vwaps
-    | Some `Sell -> `Sell, Int.Map.min_elt, OrderBook.asks, OrderBook.ask_vwaps
-    | _ -> invalid_arg "on_orderbook: side unset"
+    let best_elt_f, books, vwaps = match h.side with
+    | `buy -> Int.Map.max_elt, OrderBook.bids, OrderBook.bid_vwaps
+    | `sell -> Int.Map.min_elt, OrderBook.asks, OrderBook.ask_vwaps
+    | `buy_sell_unset -> invalid_arg "on_orderbook: side unset"
     in
     let old_book = if action = Bmex_ws.Response.Update.Partial then Int.Map.empty else
       String.Table.find_exn books h.symbol
@@ -292,11 +291,12 @@ let on_orderbook action data =
     (* end; *)
 
     if action = Partial then begin
-      debug "[OB] %s %s initialized" h.symbol (Bmex.Side.to_string side);
+      debug "[OB] %s %s initialized" h.symbol (Bmex.Side.to_string h.side);
       let { bids_initialized; asks_initialized } = String.Table.find_exn quoted_instruments h.symbol in
-      match side with
-      | `Buy -> Ivar.fill_if_empty bids_initialized ()
-      | `Sell -> Ivar.fill_if_empty asks_initialized ()
+      match h.side with
+      | `buy -> Ivar.fill_if_empty bids_initialized ()
+      | `sell -> Ivar.fill_if_empty asks_initialized ()
+      | `buy_sell_unset -> ()
     end
 
   | _ -> ()
@@ -314,9 +314,9 @@ let on_exec es =
     let side = RespObj.string_exn e "side" |> Bmex.Side.of_string in
     let current_table =
       match side with
-      | None -> invalid_arg "on_exec: side unset"
-      | Some `Buy -> current_bids
-      | Some `Sell -> current_asks in
+      | `buy_sell_unset -> invalid_arg "on_exec: side unset"
+      | `buy -> current_bids
+      | `sell -> current_asks in
     if clOrdID <> "" then String.Table.set current_table symbol e;
     debug "[E] %s %s (%s)" symbol execType (String.sub orderID 0 8);
     match execType with
@@ -326,9 +326,9 @@ let on_exec es =
       let lastQty = RespObj.int64_exn e "lastQty" |> Int64.to_int_exn in
       let lastQty =
         match side with
-        | None -> invalid_arg "on_exec: side unset"
-        | Some `Buy -> lastQty
-        | Some `Sell -> Int.neg lastQty in
+        | `buy_sell_unset -> invalid_arg "on_exec: side unset"
+        | `buy -> lastQty
+        | `sell -> Int.neg lastQty in
       String.Table.update positions symbol ~f:begin function
       | Some qty ->
         don't_wait_for @@ on_position_update symbol qty lastQty;
@@ -338,14 +338,13 @@ let on_exec es =
     | _ -> ()
   end
 
-let import_positions = function
-| `List ps -> List.iter ps ~f:begin fun p ->
+let import_positions ps =
+  List.iter ps ~f:begin fun p ->
     let p = RespObj.of_json p in
     let symbol = RespObj.string_exn p "symbol" in
     let currentQty = RespObj.int64_exn p "currentQty" |> Int64.to_int_exn in
     String.Table.set positions symbol currentQty
   end
-| #Yojson.Safe.json -> invalid_arg "import_positions"
 
 let on_ws_msg msg =
   let open Bmex_ws in
@@ -356,31 +355,35 @@ let on_ws_msg msg =
   | Error err ->
     error "BitMEX: %s" err;
     Deferred.unit
-  | Response { topic; symbol } ->
-    info "BitMEX: subscribed to %s" (Topic.show topic) ;
+  | Response { subscribe } ->
+    Option.iter subscribe ~f:begin fun { topic } ->
+      info "BitMEX: subscribed to %s" (Topic.show topic)
+    end ;
     Deferred.unit
   | Update { table; action; data } ->
     match table with
-    | "instrument" -> on_instrument action data; Deferred.unit
-    | "orderBookL2" ->
+    | Instrument -> on_instrument action data; Deferred.unit
+    | OrderBookL2 ->
       if Ivar.is_full instruments_initialized then on_orderbook action data
       else don't_wait_for begin
           Ivar.read instruments_initialized >>| fun () ->
           on_orderbook action data
         end;
       Deferred.unit
-    | "execution" -> begin
+    | Execution -> begin
         if action = Partial then Ivar.fill_if_empty execs_initialized ()
         else if action = Insert then on_exec data
       end;
       Deferred.unit
-    | _ -> error "Invalid table %s" table; Deferred.unit
+    | _ ->
+      error "Invalid table %s" (Topic.to_string table) ;
+      Deferred.unit
 
 let market_make strategy instruments =
   (* Cancel all orders *)
   Deferred.Or_error.ok_exn (Order.cancel_all !order_cfg) >>= fun _str ->
   info "all orders canceled";
-  Deferred.Or_error.ok_exn (Order.position !order_cfg) >>= fun ps ->
+  Deferred.Or_error.ok_exn (Order.position !order_cfg) >>= fun (_resp, ps) ->
   import_positions ps;
   info "positions imported";
   let topics = List.(map instruments ~f:(fun i -> ["execution"; "instrument:" ^ i; "orderBookL2:" ^ i]) |> concat) in
@@ -406,21 +409,22 @@ let market_make strategy instruments =
 let tickers_of_instrument ?log symbol =
   match String.subo symbol ~len:3 with
   | "ETH" ->
-    let open Plnx_ws in
+    let open Plnx_ws_new in
     let to_ws, to_ws_w = Pipe.create () in
-    let evts = open_connection to_ws in
+    let _cond, evts = open_connection to_ws in
+    Pipe.write_without_pushback to_ws_w (Subscribe "ticker") ;
     Pipe.filter_map evts ~f:begin function
-    | Wamp.Welcome _ ->
-      don't_wait_for @@ Deferred.ignore @@ M.subscribe to_ws_w ["ticker"];
+    | Error err ->
+      error "%s" err ;
       None
-    | Event { args } ->
-      let { Plnx.Ticker.symbol; bid; ask } = M.read_ticker @@ Msgpck.List args in
-      if symbol <> to_remote_sym "ETHXBT" then None
-      else begin
-        Option.iter log ~f:(fun log -> Log.debug log "[T] PLNX %s %f %f" symbol bid ask);
-        Some (satoshis_int_of_float_exn bid, satoshis_int_of_float_exn ask)
-      end
-    | _ -> None
+    | Event { events } ->
+      (* let { Plnx.Ticker.symbol; bid; ask } = M.read_ticker @@ Msgpck.List args in *)
+      (* if symbol <> to_remote_sym "ETHXBT" then None *)
+      (* else begin *)
+      (*   Option.iter log ~f:(fun log -> Log.debug log "[T] PLNX %s %f %f" symbol bid ask); *)
+      (*   Some (satoshis_int_of_float_exn bid, satoshis_int_of_float_exn ask) *)
+      (* end *)
+      None (* FIXME *)
     end
   | _ -> invalid_arg "tickers_of_instrument"
 
@@ -434,11 +438,10 @@ let main cfg port daemon pidfile logfile loglevel wsllevel main dry fixed remfix
     end in
     let { Cfg.key; secret; quote } =
       List.Assoc.find_exn ~equal:String.(=) cfg (if main then "BMEX" else "BMEXT") in
-    let secret_cstruct = Cstruct.of_string secret in
     testnet := not main;
     api_key := key;
-    api_secret := secret_cstruct;
-    order_cfg := Order.create_cfg ~dry_run:dry ~current_bids ~current_asks ~testnet:(not main) ~key ~secret:secret_cstruct ();
+    api_secret := secret;
+    order_cfg := Order.create_cfg ~dry_run:dry ~current_bids ~current_asks ~testnet:(not main) ~key ~secret ();
     let instruments = if instruments = [] then quote else instruments in
     let log_outputs = Log.Output.[stderr (); file `Text ~filename:logfile] in
     set_output log_outputs;

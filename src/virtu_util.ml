@@ -9,8 +9,8 @@ module Order = struct
 
   type cfg = {
     dry_run: bool ;
-    current_bids: R.Order.t String.Table.t ;
-    current_asks: R.Order.t String.Table.t ;
+    current_bids: RespObj.t String.Table.t ;
+    current_asks: RespObj.t String.Table.t ;
     testnet: bool ;
     key: string ;
     secret: string ;
@@ -27,10 +27,24 @@ module Order = struct
       ?log () =
     { dry_run ; current_bids ; current_asks ; testnet ; key ; secret ; log }
 
-  let oid_of_respobj o = match RespObj.(string o "clOrdID", string o "orderID") with
-  | Some clOrdID, _ when clOrdID <> "" -> `C, clOrdID
-  | _, Some orderID when orderID <> "" -> `S, orderID
-  | _ -> invalid_arg "oid_of_respobj"
+  module Oid = struct
+    type t =
+      | Server of Uuid.t
+      | Client of string
+
+    let pp ppf = function
+    | Server oid -> Format.fprintf ppf "orderID %s" (Uuid.to_string oid)
+    | Client oid -> Format.fprintf ppf "clOrdID %s" oid
+
+    let show t =
+      Format.asprintf "%a" pp t
+  end
+
+  let oid_of_respobj o =
+    match RespObj.(string o "clOrdID", string o "orderID") with
+    | Some clOrdID, _ when clOrdID <> "" -> Oid.Client clOrdID
+    | _, Some orderID when orderID <> "" -> Server (Uuid.of_string orderID)
+    | _ -> invalid_arg "oid_of_respobj"
 
   let position cfg =
     R.Position.get ?log:cfg.log ~testnet:cfg.testnet ~key:cfg.key ~secret:cfg.secret ()
@@ -46,14 +60,6 @@ module Order = struct
       ~testnet:cfg.testnet
       ~key:cfg.key
       ~secret:cfg.secret orders >>| function
-    | Ok res ->
-      List.iter orders ~f:begin fun o ->
-        match Int.sign o.orderQty with
-        | Zero -> ()
-        | Pos -> String.Table.set cfg.current_bids o.symbol o
-        | Neg -> String.Table.set cfg.current_asks o.symbol o
-      end ;
-      Ok res
     | Error err ->
       List.iter orders ~f:begin fun o ->
         match Int.sign o.orderQty with
@@ -62,6 +68,20 @@ module Order = struct
         | Neg -> String.Table.remove cfg.current_asks o.symbol
       end ;
       Error err
+    | Ok (resp, body) ->
+      match body with
+      | `List orders ->
+        List.iter orders ~f:begin fun o ->
+          let o = RespObj.of_json o in
+          let symbol = RespObj.string_exn o "symbol" in
+          match Int64.sign (RespObj.int64_exn o "orderQty") with
+          | Zero -> ()
+          | Pos -> String.Table.set cfg.current_bids symbol o
+          | Neg -> String.Table.set cfg.current_asks symbol o
+        end ;
+        Ok (resp, body)
+      | #Yojson.Safe.json as json ->
+        invalid_arg (Yojson.Safe.to_string json)
 
   let update_table table sym o =
     String.Table.update table sym ~f:begin function
@@ -71,24 +91,27 @@ module Order = struct
     | None -> o
     end
 
-  (* let update cfg orders = *)
-  (*   if orders = [] then Deferred.Or_error.error_string "update: empty orders" *)
-  (*   else if cfg.dry_run then *)
-  (*     Deferred.Or_error.return (Cohttp.Response.make (), `Assoc []) *)
-  (*   else *)
-  (*   R.Order.amend_bulk *)
-  (*     ?log:cfg.log *)
-  (*     ~testnet:cfg.testnet *)
-  (*     ~key:cfg.key *)
-  (*     ~secret:cfg.secret orders  >>| function *)
-  (*   | Error err -> Error err *)
-  (*   | Ok res -> List.iter orders ~f:begin fun o -> *)
-  (*       match Option.value_map ~default:Sign.Zero ~f:Int.sign o.leavesQty with *)
-  (*       | Zero -> () *)
-  (*       | Pos -> update_table cfg.current_bids o.symbol o *)
-  (*       | Neg -> update_table cfg.current_asks o.symbol o *)
-  (*     end ; *)
-  (*     Ok res *)
+  let update ?buf cfg orders =
+    if orders = [] then
+      Deferred.Or_error.error_string "update: empty orders"
+    else if cfg.dry_run then
+      Deferred.Or_error.return (Cohttp.Response.make (), `Assoc [])
+    else
+    R.Order.amend_bulk
+      ?buf
+      ?log:cfg.log
+      ~testnet:cfg.testnet
+      ~key:cfg.key
+      ~secret:cfg.secret orders  >>| function
+    | Error err -> Error err
+    | Ok res -> (* List.iter orders ~f:begin fun o -> *)
+      (*   match Option.value_map ~default:Sign.Zero ~f:Int.sign o.leavesQty with *)
+      (*   | Zero -> () *)
+      (*   | Pos -> update_table cfg.current_bids o.symbol o *)
+      (*   | Neg -> update_table cfg.current_asks o.symbol o *)
+      (* end ; *)
+      (* FIXME !! *)
+      Ok res
 
   let cancel_all ?symbol ?filter cfg =
     if cfg.dry_run then begin
@@ -179,18 +202,19 @@ let mk_new_market_order ~symbol ~orderQty =
   Bmex_rest.Order.create ~symbol ~orderQty ~ordType:`order_type_market ()
 
 let mk_new_limit_order ~clOrdID ~symbol ~orderQty ~ticksize ~price =
-  Bmex_rest.Order.create ~symbol ~clOrdID ~orderQty
+  Bmex_rest.Order.create
+    ~symbol
+    ~clOrdID
+    ~orderQty
     ~price:(float_of_satoshis symbol ticksize price)
-    ~execInst:[ParticipateDoNotInitiate] ()
-
-type order_id =
-  | Server of Uuid.t
-  | Client of string
+    ~execInst:[ParticipateDoNotInitiate]
+    ~ordType:`order_type_limit
+    ()
 
 let mk_amended_limit_order ?price ?leavesQty ~symbol ~ticksize oid =
   let orderID, clOrdID =
     match oid with
-    | Server oid -> Some oid, None
+    | Order.Oid.Server oid -> Some oid, None
     | Client oid -> None, Some oid in
   let price = Option.map price
       ~f:(fun price -> (float_of_satoshis symbol ticksize price)) in

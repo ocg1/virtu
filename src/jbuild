@@ -1,6 +1,6 @@
 (executables
- ((names (hedger livesim logobs pnlsim poloarb simu))
-  (public_names (hedger livesim logobs pnlsim poloarb simu))
+ ((names (hedger livesim logobs pnlsim poloarb simu virtu))
+  (public_names (hedger livesim logobs pnlsim poloarb simu virtu))
   (preprocess (pps (ppx_sexp_conv ppx_bin_prot ppx_compare ppx_hash)))
   (libraries (ocplib-json-typed
               tick

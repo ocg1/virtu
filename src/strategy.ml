@@ -30,16 +30,16 @@ module Common (C : Cfg) = struct
 
   let update_orders_price symbol side dprice tickSize =
     let mk_order o =
-      let orig, oid = Order.oid_of_respobj o in
+      let oid = Order.oid_of_respobj o in
       let old_price = satoshis_int_of_float_exn @@ RespObj.float_exn o "price" in
       let new_price = match dprice with `Abs p -> p | `Diff dp -> old_price + dp in
       if old_price = new_price then None else begin
         Log.info log "update order price %s %s %s %d -> %d"
           symbol (match side with `Buy -> "B" | `Sell -> "S")
-          (String.sub oid 0 8)
+          (Order.Oid.show oid)
           (old_price / tickSize) (new_price / tickSize);
         let ticksize = String.Table.find_exn ticksizes symbol in
-        Option.some @@ mk_amended_limit_order ~symbol ~side ~ticksize ~price:new_price orig oid
+        Option.some @@ mk_amended_limit_order ~symbol ~ticksize ~price:new_price oid
       end
     in
     let table = match side with
@@ -96,7 +96,10 @@ module Blanket (C : Cfg) = struct
             let newLocAsk = local_best_price ?remove_order:currentAskPQty `Sell symbol |> Option.map ~f:fst in
             let orders =
               match !oldLocBid, !oldLocAsk, newLocBid, newLocAsk with
-              | Some oldlb, Some oldla, Some newlb, Some newla when oldlb <> oldla || newlb <> newla || newRemBid <> !oldRemBid || newRemAsk <> !oldRemAsk ->
+              | Some oldlb, Some oldla, Some newlb, Some newla when
+                  oldlb <> oldla || newlb <> newla
+                  || newRemBid <> !oldRemBid
+                  || newRemAsk <> !oldRemAsk ->
                 update_price ~remBid:newRemBid ~remAsk:newRemAsk ~locBid:newlb ~locAsk:newla symbol strategy
               | _ -> []
             in
@@ -108,7 +111,7 @@ module Blanket (C : Cfg) = struct
             | [] -> Deferred.unit
             | _ -> Order.update Lazy.(force order_cfg) orders >>| function
               | Ok _ -> ()
-              | Error err -> Log.error log "strategy: %s: %s" (Yojson.Safe.to_string (`List orders)) (Error.to_string_hum err)
+              | Error err -> Log.error log "strategy: %s" (Error.to_string_hum err)
             end
           end
       in

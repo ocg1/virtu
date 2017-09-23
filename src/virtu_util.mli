@@ -48,8 +48,8 @@ val best_of_side :
 module Order : sig
   type cfg = {
     dry_run: bool ;
-    current_bids: Bmex_rest.Order.t String.Table.t ;
-    current_asks: Bmex_rest.Order.t String.Table.t ;
+    current_bids: RespObj.t String.Table.t ;
+    current_asks: RespObj.t String.Table.t ;
     testnet: bool ;
     key: string ;
     secret: string ;
@@ -58,14 +58,22 @@ module Order : sig
 
   val create_cfg :
     ?dry_run:bool ->
-    ?current_bids:Bmex_rest.Order.t String.Table.t ->
-    ?current_asks:Bmex_rest.Order.t String.Table.t ->
+    ?current_bids:RespObj.t String.Table.t ->
+    ?current_asks:RespObj.t String.Table.t ->
     ?testnet:bool ->
     ?key:string -> ?secret:string -> ?log:Log.t -> unit -> cfg
 
-  val oid_of_respobj :
-    Yojson.Safe.json String.Map.t -> [`C | `S] * string
+  module Oid : sig
+    type t =
+      | Server of Uuid.t
+      | Client of string
 
+    val pp : Format.formatter -> t -> unit
+    val show : t -> string
+  end
+
+  val oid_of_respobj :
+    Yojson.Safe.json String.Map.t -> Oid.t
   val position :
     cfg -> (Cohttp.Response.t * Yojson.Safe.json list) Deferred.Or_error.t
 
@@ -75,9 +83,11 @@ module Order : sig
     Bmex_rest.Order.t list ->
     (Cohttp.Response.t * Yojson.Safe.json) Deferred.Or_error.t
 
-  (* val update : *)
-  (*   cfg -> Yojson.Safe.json list -> *)
-  (*   Yojson.Safe.json Deferred.Or_error.t *)
+  val update :
+    ?buf:Bi_outbuf.t ->
+    cfg ->
+    Bmex_rest.Order.amend list ->
+    (Cohttp.Response.t * Yojson.Safe.json) Deferred.Or_error.t
 
   val cancel_all :
     ?symbol:string ->
@@ -89,16 +99,12 @@ module Order : sig
     Cohttp.Response.t Deferred.Or_error.t
 end
 
-type order_id =
-  | Server of Uuid.t
-  | Client of string
-
 val mk_amended_limit_order :
   ?price:int ->
   ?leavesQty:int ->
   symbol:string ->
   ticksize:ticksize ->
-  order_id ->
+  Order.Oid.t ->
   Bmex_rest.Order.amend
 
 val mk_new_market_order :
@@ -112,7 +118,6 @@ val mk_new_limit_order :
   orderQty:int ->
   ticksize:ticksize ->
   price:int ->
-  ordType:Bmex.OrderType.t ->
   Bmex_rest.Order.t
 
 
