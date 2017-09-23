@@ -12,6 +12,7 @@ module Yojson_encoding = struct
 
   let safe_destruct encoding v =
     try destruct encoding v with exn -> begin
+        error "%s" (Yojson.Safe.to_string v) ;
         error "%s" (Format.asprintf "%a" (Json_encoding.print_error ?print_unknown:None) exn) ;
         raise exn
       end
@@ -348,7 +349,7 @@ let import_positions ps =
 
 let on_ws_msg msg =
   let open Bmex_ws in
-  match Yojson_encoding.destruct Response.encoding msg with
+  match Yojson_encoding.safe_destruct Response.encoding msg with
   | Welcome _ ->
     info "WS: connected";
     Deferred.unit
@@ -356,8 +357,9 @@ let on_ws_msg msg =
     error "BitMEX: %s" err;
     Deferred.unit
   | Response { subscribe } ->
-    Option.iter subscribe ~f:begin fun { topic } ->
-      info "BitMEX: subscribed to %s" (Topic.show topic)
+    Option.iter subscribe ~f:begin fun { topic ; symbol } ->
+      let symbol = match symbol with | None -> "" | Some sym -> sym in
+      info "BitMEX: subscribed to %s (%s)" (Topic.show topic) symbol
     end ;
     Deferred.unit
   | Update { table; action; data } ->
@@ -449,10 +451,11 @@ let main cfg port daemon pidfile logfile loglevel wsllevel main dry fixed remfix
     set_level @@ loglevel_of_int loglevel;
     Log.set_level log_ws @@ loglevel_of_int wsllevel;
     hedger_port := port;
+    let fake_feed, _ = Pipe.create () in
     List.iter instruments ~f:begin fun (symbol, max_pos_size) ->
       let data = create_instrument_info
           ~max_pos_size
-          ~ticker:(tickers_of_instrument symbol)
+          ~ticker:fake_feed
           ()
       in
       String.Table.set quoted_instruments ~key:symbol ~data
