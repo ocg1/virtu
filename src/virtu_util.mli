@@ -52,7 +52,7 @@ module Order : sig
     current_asks: Bmex_rest.Order.t String.Table.t ;
     testnet: bool ;
     key: string ;
-    secret: Cstruct.t ;
+    secret: string ;
     log: Log.t option ;
   }
 
@@ -61,13 +61,13 @@ module Order : sig
     ?current_bids:Bmex_rest.Order.t String.Table.t ->
     ?current_asks:Bmex_rest.Order.t String.Table.t ->
     ?testnet:bool ->
-    ?key:string -> ?secret:Cstruct.t -> ?log:Log.t -> unit -> cfg
+    ?key:string -> ?secret:string -> ?log:Log.t -> unit -> cfg
 
   val oid_of_respobj :
     Yojson.Safe.json String.Map.t -> [`C | `S] * string
 
   val position :
-    cfg -> (Cohttp.Response.t * Yojson.Safe.json) Deferred.Or_error.t
+    cfg -> (Cohttp.Response.t * Yojson.Safe.json list) Deferred.Or_error.t
 
   val submit :
     ?buf:Bi_outbuf.t ->
@@ -89,13 +89,16 @@ module Order : sig
     Cohttp.Response.t Deferred.Or_error.t
 end
 
+type order_id =
+  | Server of Uuid.t
+  | Client of string
+
 val mk_amended_limit_order :
   ?price:int ->
   ?leavesQty:int ->
   symbol:string ->
   ticksize:ticksize ->
-  [< `C | `S ] ->
-  string ->
+  order_id ->
   Bmex_rest.Order.amend
 
 val mk_new_market_order :

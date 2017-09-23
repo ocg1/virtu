@@ -137,16 +137,22 @@ let execute_arbitrage ?(dry_run=true) ?buf cycle =
           pricef';
         Deferred.unit
       | false ->
-        Plnx_rest.order ?buf ~key:!key ~secret:!secret
-          ~side:`Buy  ~tif:`Fill_or_kill ~symbol
+        Plnx_rest.submit_order ?buf ~key:!key ~secret:!secret
+          ~side:`buy
+          ~tif:`Fill_or_kill
+          ~symbol
           ~price
           ~qty:q2 () >>| function
         | Error err -> failwith (Plnx_rest.Http_error.to_string err)
         | Ok { id; trades; amount_unfilled } ->
+          let trades =
+            List.fold_left trades ~init:[] ~f:begin fun a (_, trades) ->
+              List.rev_append trades a
+            end in
           let q1, q2 =
             List.fold_left trades
               ~init:(0., 0.)
-              ~f:begin fun (q1, q2) { ts ; side ; price ; qty } ->
+              ~f:begin fun (q1, q2) { Plnx.Trade.ts ; side ; price ; qty } ->
                 q1 -. qty *. price, q2 +. qty
               end
           in
@@ -294,11 +300,13 @@ let ws buf ws_init ob_initialized =
     end
   | Update { side; price; qty } ->
     let symbol = Int.Table.find_exn subid_to_sym subid in
+    let side = match side with | `buy -> `Buy | `sell -> `Sell | `buy_sell_unset -> invalid_arg "`buy_sell_unset" in
     let { base } = String.Table.find_exn currs symbol in
     if String.Set.mem !arbitrable_symbols base then
       on_update ~id ~symbol ~side ~price ~qty
   | Trade { gid; id; ts; side; price; qty } ->
     let symbol = Int.Table.find_exn subid_to_sym subid in
+    let side = match side with | `buy -> `Buy | `sell -> `Sell | `buy_sell_unset -> invalid_arg "`buy_sell_unset" in
     let { base } = String.Table.find_exn currs symbol in
     if String.Set.mem !arbitrable_symbols base then
       on_trade ~id ~symbol ~ts ~price ~qty ~side
@@ -356,9 +364,11 @@ let update_books_for_symbol ?depth buf symbol =
   | Error _ -> ()
   | Ok { asks; bids; isFrozen; seq } ->
     List.iter bids ~f:begin fun { side; price; qty } ->
+      let side = match side with | `buy -> `Buy | `sell -> `Sell | `buy_sell_unset -> invalid_arg "`buy_sell_unset" in
       let (_:bool) = set_entry ~symbol ~side ~price ~qty ~seq in ()
     end;
     List.iter asks ~f:begin fun { side; price; qty } ->
+      let side = match side with | `buy -> `Buy | `sell -> `Sell | `buy_sell_unset -> invalid_arg "`buy_sell_unset" in
       let (_:bool) = set_entry ~symbol ~side ~price ~qty ~seq in ()
     end
 

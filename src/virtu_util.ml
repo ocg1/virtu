@@ -13,7 +13,7 @@ module Order = struct
     current_asks: R.Order.t String.Table.t ;
     testnet: bool ;
     key: string ;
-    secret: Cstruct.t ;
+    secret: string ;
     log: Log.t option ;
   }
 
@@ -23,7 +23,7 @@ module Order = struct
       ?(current_asks=String.Table.create ())
       ?(testnet=true)
       ?(key="")
-      ?(secret=Cstruct.of_string "")
+      ?(secret="")
       ?log () =
     { dry_run ; current_bids ; current_asks ; testnet ; key ; secret ; log }
 
@@ -183,11 +183,15 @@ let mk_new_limit_order ~clOrdID ~symbol ~orderQty ~ticksize ~price =
     ~price:(float_of_satoshis symbol ticksize price)
     ~execInst:[ParticipateDoNotInitiate] ()
 
-let mk_amended_limit_order ?price ?leavesQty ~symbol ~ticksize orig oid =
+type order_id =
+  | Server of Uuid.t
+  | Client of string
+
+let mk_amended_limit_order ?price ?leavesQty ~symbol ~ticksize oid =
   let orderID, clOrdID =
-    match orig with
-    | `S -> Some oid, None
-    | `C -> None, Some oid in
+    match oid with
+    | Server oid -> Some oid, None
+    | Client oid -> None, Some oid in
   let price = Option.map price
       ~f:(fun price -> (float_of_satoshis symbol ticksize price)) in
   Bmex_rest.Order.create_amend ?orderID ?clOrdID ?leavesQty ?price ()

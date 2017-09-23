@@ -116,10 +116,16 @@ let simulate datafile buf instruments =
     match Yojson_encoding.destruct Bmex_ws.Response.encoding msg_json with
     | Update { table; action; data } -> begin
       match table with
-      | "instrument" -> on_instrument action data; Deferred.unit
-      | "quote" -> on_quote data; Deferred.unit
-      | "trade" -> on_trade datafile action data; Deferred.unit
-      | _ -> error "Invalid table %s" table; Deferred.unit
+      | Instrument -> on_instrument action data; Deferred.unit
+      | Quote ->
+        on_quote data;
+        Deferred.unit
+      | Trade ->
+        on_trade datafile action data;
+        Deferred.unit
+      | _ ->
+        error "Invalid table %s" (Bmex_ws.Topic.to_string table);
+        Deferred.unit
     end
     | _ -> Deferred.unit
   in

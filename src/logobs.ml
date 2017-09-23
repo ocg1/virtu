@@ -88,9 +88,9 @@ module BMEX = struct
       match Yojson_encoding.destruct Response.encoding msg_json with
       | Update { table; action; data } -> begin
         match table with
-        | "orderBookL2" -> on_evt `L2 action data
-        | "trade" -> on_evt `Trade action data
-        | _ -> error "Invalid table %s" table
+        | OrderBookL2 -> on_evt `L2 action data
+        | Trade -> on_evt `Trade action data
+        | _ -> error "Invalid table %s" (Topic.to_string table)
       end
       | _ -> ()
     in
@@ -124,14 +124,24 @@ module PLNX = struct
       let symbol = Int.Table.find_exn subid_to_sym subid in
       let price = satoshis_int_of_float_exn entry.price in
       let qty = satoshis_int_of_float_exn entry.qty in
-      let update = { DB.side = entry.side ; price ; qty } in
+      let side =
+        match entry.side with
+        | `buy -> `Buy
+        | `sell -> `Sell
+        | `buy_sell_unset -> invalid_arg "`buy_sell_unset" in
+      let update = { DB.side ; price ; qty } in
       debug "%d M %s" id @@ Fn.compose Sexp.to_string DB.sexp_of_book_entry update ;
       symbol, [if qty = 0 then DB.BRemove update else DB.BModify update]
     | Trade t ->
       let symbol = Int.Table.find_exn subid_to_sym subid in
       let price = satoshis_int_of_float_exn t.price in
       let qty = satoshis_int_of_float_exn t.qty in
-      let trade = { DB.ts = t.ts ; side = t.side ; price ; qty } in
+      let side =
+        match t.side with
+        | `buy -> `Buy
+        | `sell -> `Sell
+        | `buy_sell_unset -> invalid_arg "`buy_sell_unset" in
+      let trade = { DB.ts = t.ts ; side ; price ; qty } in
       debug "%d T %s" id @@ Fn.compose Sexp.to_string  DB.sexp_of_trade trade ;
       symbol, [DB.Trade trade]
     in

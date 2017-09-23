@@ -10,7 +10,7 @@ open Bs_devkit
 let log_bfx = Log.create ~level:`Error ~on_error:`Raise ~output:Log.Output.[stderr ()]
 
 let bfx_key = ref ""
-let bfx_secret = ref @@ Cstruct.of_string ""
+let bfx_secret = ref ""
 
 let channels : Bfx_ws.Msg.chan_descr Int.Table.t = Int.Table.create ()
 let subscriptions : int String.Table.t = String.Table.create ()
@@ -272,7 +272,7 @@ let main cfg port daemon pidfile logfile loglevel instruments () =
     end in
     let { Cfg.key; secret } = List.Assoc.find_exn ~equal:String.(=) cfg "BFX" in
     bfx_key := key;
-    bfx_secret := Cstruct.of_string secret;
+    bfx_secret := secret;
     let buf = Bi_outbuf.create 4096 in
     set_output Log.Output.[stderr (); file `Text ~filename:logfile];
     Log.set_output log_bfx Log.Output.[stderr (); file `Text ~filename:logfile];
